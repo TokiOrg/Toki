@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import csv
+import hashlib
 import io
 import math
 import threading
@@ -28,6 +29,7 @@ EXPORT_TABLES = {
         "connector_id, started_at",
     ),
     "collector_state.csv": ("collector_state", "singleton_id"),
+    "collector_gaps.csv": ("collector_gaps", "started_at"),
 }
 
 
@@ -98,6 +100,17 @@ CREATE TABLE IF NOT EXISTS collector_state (
     last_response_hash VARCHAR
 );
 
+CREATE TABLE IF NOT EXISTS collector_gaps (
+    gap_id VARCHAR PRIMARY KEY,
+    started_at TIMESTAMPTZ NOT NULL,
+    ended_at TIMESTAMPTZ NOT NULL,
+    duration_seconds DOUBLE NOT NULL,
+    reason VARCHAR NOT NULL,
+    detected_at TIMESTAMPTZ NOT NULL,
+    station_intervals_marked BIGINT NOT NULL,
+    connector_intervals_marked BIGINT NOT NULL
+);
+
 INSERT INTO collector_state (singleton_id)
 VALUES (1)
 ON CONFLICT DO NOTHING;
@@ -117,8 +130,9 @@ def _rows_as_dicts(
 class Database:
     """Serialized access to one file-backed DuckDB database."""
 
-    def __init__(self, path: Path) -> None:
+    def __init__(self, path: Path, gap_threshold_seconds: float = 120.0) -> None:
         self.path = path
+        self.gap_threshold_seconds = gap_threshold_seconds
         self._lock = threading.RLock()
 
     def _connect(self) -> duckdb.DuckDBPyConnection:
@@ -194,12 +208,19 @@ class Database:
             try:
                 state = connection.execute(
                     """
-                    SELECT last_success_at
+                    SELECT last_success_at, consecutive_failures
                     FROM collector_state
                     WHERE singleton_id = 1
                     """
                 ).fetchone()
                 previous_success = state[0] if state and state[0] else observed_at
+                failures_before_recovery = int(state[1] or 0) if state else 0
+                gap_result = self._record_gap_if_needed(
+                    connection,
+                    previous_success,
+                    observed_at,
+                    failures_before_recovery,
+                )
                 connector_changes = self._record_connectors(
                     connection, snapshot, previous_success
                 )
@@ -229,6 +250,117 @@ class Database:
             "connectors": len(snapshot.connectors),
             "station_changes": station_changes,
             "connector_changes": connector_changes,
+            "gaps_created": int(gap_result is not None),
+        }
+
+    def _record_gap_if_needed(
+        self,
+        connection: duckdb.DuckDBPyConnection,
+        previous_success: datetime,
+        observed_at: datetime,
+        failures_before_recovery: int,
+    ) -> dict[str, int] | None:
+        elapsed_seconds = (observed_at - previous_success).total_seconds()
+        if elapsed_seconds <= self.gap_threshold_seconds:
+            return None
+
+        gap_start = previous_success + timedelta(microseconds=1)
+        if gap_start >= observed_at:
+            return None
+        station_rows = _rows_as_dicts(
+            connection,
+            """
+            SELECT station_id
+            FROM station_status_intervals
+            WHERE ended_at IS NULL
+            ORDER BY station_id
+            """,
+        )
+        connector_rows = _rows_as_dicts(
+            connection,
+            """
+            SELECT connector_id, station_id
+            FROM connector_status_intervals
+            WHERE ended_at IS NULL
+            ORDER BY connector_id
+            """,
+        )
+
+        connection.execute(
+            """
+            UPDATE station_status_intervals
+            SET last_confirmed_at = ?, ended_at = ?
+            WHERE ended_at IS NULL
+            """,
+            [previous_success, gap_start],
+        )
+        connection.execute(
+            """
+            UPDATE connector_status_intervals
+            SET last_confirmed_at = ?, ended_at = ?
+            WHERE ended_at IS NULL
+            """,
+            [previous_success, gap_start],
+        )
+        for row in station_rows:
+            connection.execute(
+                """
+                INSERT INTO station_status_intervals (
+                    station_id, status, started_at, last_confirmed_at, ended_at
+                ) VALUES (?, 'unknown', ?, ?, ?)
+                """,
+                [row["station_id"], gap_start, observed_at, observed_at],
+            )
+        for row in connector_rows:
+            connection.execute(
+                """
+                INSERT INTO connector_status_intervals (
+                    connector_id, station_id, status_code, status,
+                    status_description, power_kw, price, metadata_basis,
+                    started_at, last_confirmed_at, ended_at
+                ) VALUES (?, ?, 'collector_offline', 'unknown', ?, NULL, NULL,
+                          'automatic_collector_gap', ?, ?, ?)
+                """,
+                [
+                    row["connector_id"],
+                    row["station_id"],
+                    "Collector unavailable between successful polls",
+                    gap_start,
+                    observed_at,
+                    observed_at,
+                ],
+            )
+
+        reason = (
+            "poll_failures"
+            if failures_before_recovery
+            else "collector_restart_or_suspension"
+        )
+        gap_id = hashlib.sha256(
+            f"{gap_start.isoformat()}|{observed_at.isoformat()}".encode("utf-8")
+        ).hexdigest()
+        connection.execute(
+            """
+            INSERT INTO collector_gaps (
+                gap_id, started_at, ended_at, duration_seconds, reason,
+                detected_at, station_intervals_marked,
+                connector_intervals_marked
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            [
+                gap_id,
+                gap_start,
+                observed_at,
+                (observed_at - gap_start).total_seconds(),
+                reason,
+                datetime.now(timezone.utc),
+                len(station_rows),
+                len(connector_rows),
+            ],
+        )
+        return {
+            "station_intervals_marked": len(station_rows),
+            "connector_intervals_marked": len(connector_rows),
         }
 
     def _record_connectors(
@@ -453,18 +585,46 @@ class Database:
                     (SELECT count(*) FROM stations) AS station_count,
                     (SELECT count(*) FROM connectors) AS connector_count,
                     (SELECT count(*) FROM station_status_intervals) AS station_intervals,
-                    (SELECT count(*) FROM connector_status_intervals) AS connector_intervals
+                    (SELECT count(*) FROM connector_status_intervals) AS connector_intervals,
+                    (SELECT count(*) FROM collector_gaps) AS collector_gaps
                 """
             ).fetchone()
+            latest_gap_rows = _rows_as_dicts(
+                connection,
+                """
+                SELECT *
+                FROM collector_gaps
+                ORDER BY ended_at DESC
+                LIMIT 1
+                """,
+            )
         state.update(
             {
                 "station_count": counts[0],
                 "connector_count": counts[1],
                 "station_interval_count": counts[2],
                 "connector_interval_count": counts[3],
+                "collector_gap_count": counts[4],
+                "latest_collector_gap": latest_gap_rows[0]
+                if latest_gap_rows
+                else None,
             }
         )
         return state
+
+    def list_collector_gaps(self, hours: int = 24 * 30) -> list[dict[str, Any]]:
+        cutoff_at = datetime.now(timezone.utc) - timedelta(hours=hours)
+        with self._lock, self._connect() as connection:
+            return _rows_as_dicts(
+                connection,
+                """
+                SELECT *
+                FROM collector_gaps
+                WHERE ended_at >= ?
+                ORDER BY ended_at DESC
+                """,
+                [cutoff_at],
+            )
 
     def summary(self) -> dict[str, Any]:
         with self._lock, self._connect() as connection:
@@ -646,6 +806,7 @@ class Database:
                     ("station_status_intervals", "station_id, started_at"),
                     ("connector_status_intervals", "connector_id, started_at"),
                     ("collector_state", "singleton_id"),
+                    ("collector_gaps", "started_at"),
                 )
             }
             station_history = _rows_as_dicts(
@@ -845,6 +1006,12 @@ class Database:
                 "busy_hours": 0.0,
                 "maintenance_hours": 0.0,
                 "unknown_hours": 0.0,
+                "observed_station_hours": 0.0,
+                "known_station_hours": 0.0,
+                "coverage_percent": 0.0,
+                "busy_percent": 0.0,
+                "availability_percent": 0.0,
+                "maintenance_percent": 0.0,
                 "busy_events": 0,
                 "charging_events": 0,
                 "charging_connector_hours": 0.0,
@@ -903,6 +1070,34 @@ class Database:
 
         station_analytics = list(station_metrics.values())
         for metric in station_analytics:
+            observed_hours = sum(
+                float(metric[key])
+                for key in (
+                    "available_hours",
+                    "busy_hours",
+                    "maintenance_hours",
+                    "unknown_hours",
+                )
+            )
+            known_hours = observed_hours - float(metric["unknown_hours"])
+            metric["observed_station_hours"] = observed_hours
+            metric["known_station_hours"] = known_hours
+            metric["coverage_percent"] = (
+                known_hours / observed_hours if observed_hours else 0.0
+            )
+            metric["busy_percent"] = (
+                float(metric["busy_hours"]) / known_hours if known_hours else 0.0
+            )
+            metric["availability_percent"] = (
+                float(metric["available_hours"]) / known_hours
+                if known_hours
+                else 0.0
+            )
+            metric["maintenance_percent"] = (
+                float(metric["maintenance_hours"]) / known_hours
+                if known_hours
+                else 0.0
+            )
             energy = metric["rated_energy_ceiling_kwh"]
             if energy > 0:
                 metric["energy_weighted_price"] = (
@@ -913,6 +1108,12 @@ class Database:
                 "busy_hours",
                 "maintenance_hours",
                 "unknown_hours",
+                "observed_station_hours",
+                "known_station_hours",
+                "coverage_percent",
+                "busy_percent",
+                "availability_percent",
+                "maintenance_percent",
                 "charging_connector_hours",
                 "rated_energy_ceiling_kwh",
                 "rated_power_revenue_ceiling_amd",
@@ -957,6 +1158,7 @@ class Database:
                 "scenario_load_factor": 0.5,
                 "currency": "AMD",
                 "price_interpretation": "provider price field per kWh",
+                "gap_threshold_seconds": self.gap_threshold_seconds,
             },
             "station_analytics": station_analytics,
             "station_history": station_history,
@@ -994,6 +1196,9 @@ class Database:
                     "current_busy": 0,
                     "current_maintenance": 0,
                     "observed_station_hours": 0.0,
+                    "known_station_hours": 0.0,
+                    "unknown_station_hours": 0.0,
+                    "coverage_percent": 0.0,
                     "busy_hours": 0.0,
                     "busy_percent": 0.0,
                     "maintenance_hours": 0.0,
@@ -1032,11 +1237,15 @@ class Database:
                     for connector in connectors
                 ),
                 "observed_hours": 0.0,
+                "known_hours": 0.0,
                 "available_hours": 0.0,
                 "busy_hours": 0.0,
                 "maintenance_hours": 0.0,
                 "unknown_hours": 0.0,
+                "coverage_percent": 0.0,
                 "busy_percent": 0.0,
+                "availability_percent": 0.0,
+                "maintenance_percent": 0.0,
                 "charging_connector_hours": 0.0,
                 "rated_energy_ceiling_kwh": 0.0,
                 "weighted_price_amd_per_kwh": None,
@@ -1092,8 +1301,19 @@ class Database:
                     price_numerators[metric["station_id"]] / energy
                 )
             if metric["observed_hours"] > 0:
-                metric["busy_percent"] = (
-                    metric["busy_hours"] / metric["observed_hours"]
+                metric["known_hours"] = (
+                    metric["observed_hours"] - metric["unknown_hours"]
+                )
+                metric["coverage_percent"] = (
+                    metric["known_hours"] / metric["observed_hours"]
+                )
+            if metric["known_hours"] > 0:
+                metric["busy_percent"] = metric["busy_hours"] / metric["known_hours"]
+                metric["availability_percent"] = (
+                    metric["available_hours"] / metric["known_hours"]
+                )
+                metric["maintenance_percent"] = (
+                    metric["maintenance_hours"] / metric["known_hours"]
                 )
             metric["scenario_revenue_amd"] = (
                 price_numerators[metric["station_id"]] * scenario_load_factor
@@ -1119,6 +1339,9 @@ class Database:
                     "station_count": 0,
                     "current_busy_stations": 0,
                     "observed_station_hours": 0.0,
+                    "known_station_hours": 0.0,
+                    "unknown_station_hours": 0.0,
+                    "coverage_percent": 0.0,
                     "busy_hours": 0.0,
                     "charging_connector_hours": 0.0,
                     "scenario_revenue_amd": 0.0,
@@ -1129,6 +1352,8 @@ class Database:
             area["station_count"] += 1
             area["current_busy_stations"] += station["current_status"] == "busy"
             area["observed_station_hours"] += station["observed_hours"]
+            area["known_station_hours"] += station["known_hours"]
+            area["unknown_station_hours"] += station["unknown_hours"]
             area["busy_hours"] += station["busy_hours"]
             area["charging_connector_hours"] += station[
                 "charging_connector_hours"
@@ -1141,7 +1366,9 @@ class Database:
         areas = list(area_metrics.values())
         for area in areas:
             observed = area["observed_station_hours"]
-            area["busy_percent"] = area["busy_hours"] / observed if observed else 0.0
+            known = area["known_station_hours"]
+            area["coverage_percent"] = known / observed if observed else 0.0
+            area["busy_percent"] = area["busy_hours"] / known if known else 0.0
             area["center_latitude"] = (area["south"] + area["north"]) / 2
             area["center_longitude"] = (area["west"] + area["east"]) / 2
             area.pop("top_station_busy_hours", None)
@@ -1153,6 +1380,9 @@ class Database:
                 "center_latitude",
                 "center_longitude",
                 "observed_station_hours",
+                "known_station_hours",
+                "unknown_station_hours",
+                "coverage_percent",
                 "busy_hours",
                 "busy_percent",
                 "charging_connector_hours",
@@ -1162,6 +1392,8 @@ class Database:
         areas.sort(key=lambda area: -area["busy_hours"])
 
         observed_hours = sum(row["observed_hours"] for row in station_rows)
+        known_hours = sum(row["known_hours"] for row in station_rows)
+        unknown_hours = sum(row["unknown_hours"] for row in station_rows)
         busy_hours = sum(row["busy_hours"] for row in station_rows)
         portfolio = {
             "station_count": len(station_rows),
@@ -1175,9 +1407,15 @@ class Database:
                 row["current_status"] == "maintenance" for row in station_rows
             ),
             "observed_station_hours": round(observed_hours, 6),
+            "known_station_hours": round(known_hours, 6),
+            "unknown_station_hours": round(unknown_hours, 6),
+            "coverage_percent": round(
+                known_hours / observed_hours if observed_hours else 0.0,
+                6,
+            ),
             "busy_hours": round(busy_hours, 6),
             "busy_percent": round(
-                busy_hours / observed_hours if observed_hours else 0.0,
+                busy_hours / known_hours if known_hours else 0.0,
                 6,
             ),
             "maintenance_hours": round(
@@ -1193,11 +1431,15 @@ class Database:
         for metric in station_rows:
             for key in (
                 "observed_hours",
+                "known_hours",
                 "available_hours",
                 "busy_hours",
                 "maintenance_hours",
                 "unknown_hours",
+                "coverage_percent",
                 "busy_percent",
+                "availability_percent",
+                "maintenance_percent",
                 "charging_connector_hours",
                 "rated_energy_ceiling_kwh",
                 "scenario_revenue_amd",

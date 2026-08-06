@@ -309,12 +309,22 @@ class TelegramService:
         elif command == "/status":
             health = await asyncio.to_thread(self.database.health)
             last_success = health.get("last_success_at") or "not available"
+            latest_gap = health.get("latest_collector_gap")
+            gap_text = "none"
+            if latest_gap:
+                duration_minutes = float(latest_gap.get("duration_seconds") or 0) / 60
+                gap_text = (
+                    f"{latest_gap.get('started_at')} → {latest_gap.get('ended_at')} "
+                    f"({duration_minutes:.1f} min)"
+                )
             response = (
                 f"Collector last success: {last_success}\n"
                 f"Polls: {health.get('poll_count', 0)}\n"
                 f"Stations: {health.get('station_count', 0)}\n"
                 f"Connectors: {health.get('connector_count', 0)}\n"
-                f"Consecutive failures: {health.get('consecutive_failures', 0)}"
+                f"Consecutive failures: {health.get('consecutive_failures', 0)}\n"
+                f"Recorded gaps: {health.get('collector_gap_count', 0)}\n"
+                f"Latest gap: {gap_text}"
             )
             await self.client.send_message(self.chat_id, response)
         elif command == "/excel":

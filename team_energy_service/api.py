@@ -1,15 +1,17 @@
 from __future__ import annotations
 
 import asyncio
+import base64
+import binascii
 import logging
+import secrets
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Annotated
 
 from fastapi import FastAPI, HTTPException, Query, Request
-from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 
 from .config import Settings
@@ -33,7 +35,7 @@ def create_app(
     start_poller: bool = True,
 ) -> FastAPI:
     settings = settings or Settings.from_environment()
-    database = Database(settings.database_path)
+    database = Database(settings.database_path, settings.gap_threshold_seconds)
     provider = provider or TeamEnergyClient(settings.request_timeout_seconds)
     poller = Poller(provider, database, settings.poll_interval_seconds)
     telegram = TelegramService(
@@ -71,12 +73,41 @@ def create_app(
         description="Private cached station API with interval-compressed history.",
         lifespan=lifespan,
     )
-    app.add_middleware(
-        CORSMiddleware,
-        allow_origins=["*"],
-        allow_methods=["GET"],
-        allow_headers=["*"],
-    )
+
+    @app.middleware("http")
+    async def require_basic_auth(request: Request, call_next):
+        if request.url.path == "/healthz" or not settings.web_username:
+            return await call_next(request)
+
+        authorization = request.headers.get("Authorization", "")
+        scheme, _, encoded = authorization.partition(" ")
+        supplied_username = ""
+        supplied_password = ""
+        if scheme.lower() == "basic" and encoded:
+            try:
+                decoded = base64.b64decode(encoded, validate=True).decode("utf-8")
+                supplied_username, separator, supplied_password = decoded.partition(":")
+                if not separator:
+                    supplied_username = ""
+                    supplied_password = ""
+            except (binascii.Error, UnicodeDecodeError):
+                pass
+
+        authenticated = secrets.compare_digest(
+            supplied_username.encode("utf-8"),
+            settings.web_username.encode("utf-8"),
+        ) and secrets.compare_digest(
+            supplied_password.encode("utf-8"),
+            (settings.web_password or "").encode("utf-8"),
+        )
+        if not authenticated:
+            return JSONResponse(
+                status_code=401,
+                content={"detail": "Authentication required"},
+                headers={"WWW-Authenticate": 'Basic realm="Toki", charset="UTF-8"'},
+            )
+        return await call_next(request)
+
     app.mount(
         "/static",
         StaticFiles(directory=STATIC_DIRECTORY),
@@ -91,6 +122,10 @@ def create_app(
             "health": "/health",
             "dashboard": "/dashboard",
         }
+
+    @app.get("/healthz", include_in_schema=False)
+    async def healthz() -> dict[str, str]:
+        return {"status": "ok"}
 
     @app.get("/dashboard", response_class=FileResponse)
     async def dashboard() -> FileResponse:
@@ -137,6 +172,17 @@ def create_app(
     @app.get("/telegram/status")
     async def telegram_status(request: Request) -> dict:
         return request.app.state.telegram.public_status()
+
+    @app.get("/collector/gaps")
+    async def collector_gaps(
+        request: Request,
+        hours: Annotated[int, Query(ge=1, le=24 * 366)] = 24 * 30,
+    ) -> dict:
+        gaps = await asyncio.to_thread(
+            request.app.state.database.list_collector_gaps,
+            hours,
+        )
+        return {"count": len(gaps), "gaps": gaps}
 
     @app.get("/stations")
     async def stations(

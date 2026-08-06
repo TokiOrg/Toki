@@ -1,4 +1,4 @@
-# Team Energy local history API
+# Toki — Team Energy history API
 
 This is a small private service that:
 
@@ -32,7 +32,8 @@ Open:
 - Stations: <http://127.0.0.1:8010/stations>
 
 The first Team Energy request runs immediately when the service starts. Until
-it finishes, `/health` reports `initializing`.
+it finishes, `/health` reports `initializing`. If web credentials are set,
+every route except `/healthz` uses HTTP Basic authentication.
 
 ## Configuration
 
@@ -43,10 +44,12 @@ Environment variables and defaults:
 | `TEAM_ENERGY_DB_PATH` | `./data/team_energy.duckdb` | Persistent DuckDB file |
 | `TEAM_ENERGY_POLL_INTERVAL_SECONDS` | `30` | Delay between successful polls |
 | `TEAM_ENERGY_STALE_AFTER_SECONDS` | `120` | Age after which data is marked stale |
+| `TEAM_ENERGY_GAP_THRESHOLD_SECONDS` | `120` | Longer time between successful polls becomes an unknown interval |
 | `TEAM_ENERGY_REQUEST_TIMEOUT_SECONDS` | `30` | Upstream HTTP timeout |
 | `TEAM_ENERGY_HOST` | `127.0.0.1` | Local bind host |
 | `TEAM_ENERGY_PORT` | `8010` | Local port (`PORT` takes precedence) |
-| `TEAM_ENERGY_NODE_EXECUTABLE` | `node` on PATH | Node.js used for Excel generation |
+| `TEAM_ENERGY_WEB_USERNAME` | empty | Optional HTTP Basic-auth username |
+| `TEAM_ENERGY_WEB_PASSWORD` | empty | Optional HTTP Basic-auth password; set with the username |
 | `TELEGRAM_BOT_TOKEN` | empty | Secret token issued by `@BotFather` |
 | `TELEGRAM_CHAT_ID` | empty | Numeric destination group ID |
 | `TELEGRAM_REPORT_INTERVAL_HOURS` | `5` | Scheduled report interval |
@@ -72,8 +75,10 @@ Energy authorizes a higher request frequency.
 
 ```text
 GET /health
+GET /healthz
 GET /summary
 GET /analytics/map?hours=24
+GET /collector/gaps?hours=720
 GET /stations
 GET /stations?status=available
 GET /stations?q=Komitas
@@ -113,9 +118,7 @@ Telegram group commands:
 - every original DuckDB table as an individual UTF-8 CSV file.
 
 The CSV BOM makes Armenian text display correctly in Microsoft Excel. The
-workbook requires Node.js and `@oai/artifact-tool`; the local Codex workspace
-already provides that dependency. Keep `TEAM_ENERGY_NODE_EXECUTABLE` empty
-when `node` is available on PATH.
+workbook is created with XlsxWriter and has no Node.js runtime dependency.
 
 Station history is derived from connector state:
 
@@ -129,7 +132,11 @@ observed, the old interval records both the last poll that confirmed the old
 status and the first poll that observed the new status. This preserves the
 uncertainty window instead of pretending the exact transition time is known.
 The analytical workbook splits that uncertainty window at its midpoint and
-shows the raw bounds beside the estimate.
+shows the raw bounds beside the estimate. When successful polls are more than
+the configured gap threshold apart, the service closes the prior intervals,
+records the unobserved span as `unknown`, and begins fresh intervals at the
+recovery poll. Busy and availability percentages use known-status time only;
+coverage shows how much of the complete collection window is known.
 
 Revenue fields are explicitly planning scenarios. The source does not provide
 metered kWh, transaction totals, or payments. The model therefore uses only
@@ -145,3 +152,34 @@ pytest
 
 The DuckDB file is intentionally ignored by Git. When this is deployed, mount
 persistent storage at the directory containing the configured database path.
+
+## Railway deployment
+
+The production service uses one Amsterdam replica and a persistent volume at
+`/data`. Railway provides `PORT`; do not define it yourself. Required service
+variables are:
+
+```text
+TEAM_ENERGY_DB_PATH=/data/team_energy.duckdb
+TEAM_ENERGY_HOST=0.0.0.0
+TEAM_ENERGY_POLL_INTERVAL_SECONDS=30
+TEAM_ENERGY_STALE_AFTER_SECONDS=120
+TEAM_ENERGY_GAP_THRESHOLD_SECONDS=120
+TEAM_ENERGY_REQUEST_TIMEOUT_SECONDS=30
+TEAM_ENERGY_WEB_USERNAME=toki
+TEAM_ENERGY_WEB_PASSWORD=<secret>
+TELEGRAM_BOT_TOKEN=<secret>
+TELEGRAM_CHAT_ID=<group id>
+TELEGRAM_REPORT_INTERVAL_HOURS=5
+TELEGRAM_TIMEZONE=Asia/Yerevan
+```
+
+Deploy future local changes from the repository root with:
+
+```bash
+railway up --service Toki
+```
+
+Only `/healthz` is public. The dashboard, API, docs, static files, detailed
+health, and collector-gap audit endpoint require the shared web credentials.
+Keep one active service instance so Telegram long polling is not duplicated.

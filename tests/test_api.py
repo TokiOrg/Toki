@@ -73,6 +73,60 @@ def test_api_returns_not_found_for_unknown_station(tmp_path):
         assert response.status_code == 404
 
 
+def test_basic_auth_protects_application_but_not_liveness(tmp_path):
+    app = create_app(
+        settings=Settings(
+            database_path=tmp_path / "protected.duckdb",
+            web_username="toki",
+            web_password="test-password",
+        ),
+        provider=FakeProvider(),
+        start_poller=False,
+    )
+
+    with TestClient(app) as client:
+        liveness = client.get("/healthz")
+        assert liveness.status_code == 200
+        assert liveness.json() == {"status": "ok"}
+
+        protected_paths = [
+            "/",
+            "/dashboard",
+            "/docs",
+            "/openapi.json",
+            "/static/dashboard.js",
+            "/health",
+            "/summary",
+            "/analytics/map",
+            "/stations",
+            "/telegram/status",
+            "/collector/gaps",
+        ]
+        for path in protected_paths:
+            unauthorized = client.get(path)
+            assert unauthorized.status_code == 401, path
+            assert unauthorized.headers["www-authenticate"].startswith("Basic")
+
+        authorized = client.get(
+            "/health",
+            auth=("toki", "test-password"),
+        )
+        assert authorized.status_code == 200
+
+        dashboard = client.get(
+            "/dashboard",
+            auth=("toki", "test-password"),
+        )
+        assert dashboard.status_code == 200
+
+        gaps = client.get(
+            "/collector/gaps",
+            auth=("toki", "test-password"),
+        )
+        assert gaps.status_code == 200
+        assert gaps.json() == {"count": 0, "gaps": []}
+
+
 def test_map_analytics_clip_midpoint_history_to_selected_window(tmp_path):
     app = create_app(
         settings=Settings(database_path=tmp_path / "map.duckdb"),

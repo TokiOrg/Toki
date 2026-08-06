@@ -148,6 +148,7 @@
                 <th>Station</th>
                 <th>Current status</th>
                 <th class="number">Busy %</th>
+                <th class="number">Coverage %</th>
                 <th class="number">Busy hours</th>
                 <th class="number">Charging hours</th>
                 <th class="number">Scenario revenue</th>
@@ -161,7 +162,7 @@
 
       <section class="methodology-note">
         <strong>How to read this:</strong>
-        status duration uses the midpoint between the last poll with the old status and the first poll with the new status. Geographic sections aggregate a 0.025° grid. Scenario revenue uses only connector intervals marked <em>charging</em>, rated power, the provider price field, and a <span id="load-factor-note">50%</span> load factor. It is not actual collected revenue.
+        status duration uses the midpoint between the last poll with the old status and the first poll with the new status. Collector outages longer than two minutes are marked unknown and excluded from utilization percentages. Geographic sections aggregate a 0.025° grid. Scenario revenue uses only connector intervals marked <em>charging</em>, rated power, the provider price field, and a <span id="load-factor-note">50%</span> load factor. It is not actual collected revenue.
       </section>
     </main>
 

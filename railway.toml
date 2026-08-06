@@ -1,0 +1,12 @@
+[build]
+builder = "DOCKERFILE"
+dockerfilePath = "Dockerfile"
+
+[deploy]
+healthcheckPath = "/healthz"
+healthcheckTimeout = 300
+restartPolicyType = "ALWAYS"
+drainingSeconds = 30
+
+[deploy.multiRegionConfig.europe-west4-drams3a]
+numReplicas = 1

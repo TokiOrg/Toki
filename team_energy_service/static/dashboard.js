@@ -21,7 +21,7 @@ const metricDefinitions = {
     label: "Busy utilization",
     shortLabel: "Busy %",
     rankTitle: "Top stations by busy utilization",
-    subtitle: "Busy hours divided by all observed station-status hours.",
+    subtitle: "Busy hours divided by time with a known station status.",
     format: (value) => formatPercent(value),
   },
   charging_connector_hours: {
@@ -184,8 +184,10 @@ function renderKpis() {
   elements["kpi-revenue"].textContent = formatMoney(portfolio.scenario_revenue_amd);
   elements["kpi-revenue-context"].textContent =
     `${formatPercent(assumptions.scenario_load_factor)} load factor · planning estimate`;
-  elements["kpi-coverage"].textContent = `${formatNumber(dataWindow.coverage_hours, 2)} h`;
-  elements["kpi-window"].textContent = `${formatDateTime(dataWindow.start)} → ${formatDateTime(dataWindow.end)}`;
+  elements["kpi-coverage"].textContent = formatPercent(portfolio.coverage_percent);
+  elements["kpi-window"].textContent =
+    `${formatNumber(dataWindow.coverage_hours, 2)} h window · ` +
+    `${formatNumber(portfolio.unknown_station_hours, 2)} unknown station-hours`;
   elements["load-factor-note"].textContent = formatPercent(assumptions.scenario_load_factor);
 }
 
@@ -270,6 +272,9 @@ function aggregateAreas(stations) {
         station_count: 0,
         current_busy_stations: 0,
         observed_station_hours: 0,
+        known_station_hours: 0,
+        unknown_station_hours: 0,
+        coverage_percent: 0,
         busy_hours: 0,
         busy_percent: 0,
         charging_connector_hours: 0,
@@ -282,6 +287,8 @@ function aggregateAreas(stations) {
     area.station_count += 1;
     area.current_busy_stations += station.current_status === "busy" ? 1 : 0;
     area.observed_station_hours += station.observed_hours || 0;
+    area.known_station_hours += station.known_hours || 0;
+    area.unknown_station_hours += station.unknown_hours || 0;
     area.busy_hours += station.busy_hours || 0;
     area.charging_connector_hours += station.charging_connector_hours || 0;
     area.scenario_revenue_amd += station.scenario_revenue_amd || 0;
@@ -292,8 +299,11 @@ function aggregateAreas(stations) {
   }
   const areas = [...areaMap.values()];
   for (const area of areas) {
-    area.busy_percent = area.observed_station_hours > 0
-      ? area.busy_hours / area.observed_station_hours
+    area.coverage_percent = area.observed_station_hours > 0
+      ? area.known_station_hours / area.observed_station_hours
+      : 0;
+    area.busy_percent = area.known_station_hours > 0
+      ? area.busy_hours / area.known_station_hours
       : 0;
   }
   return areas;
@@ -343,6 +353,7 @@ function renderTable(stations) {
       </td>
       <td><span class="status-pill ${escapeHtml(station.current_status || "unknown")}">${escapeHtml(station.current_status || "unknown")}</span></td>
       <td class="number">${formatPercent(station.busy_percent)}</td>
+      <td class="number">${formatPercent(station.coverage_percent)}</td>
       <td class="number">${formatNumber(station.busy_hours, 2)}</td>
       <td class="number">${formatNumber(station.charging_connector_hours, 2)}</td>
       <td class="number">${formatMoney(station.scenario_revenue_amd)}</td>
@@ -381,6 +392,7 @@ function stationPopup(station) {
       <span class="status-pill ${escapeHtml(status)}">${escapeHtml(status)}</span>
       <div class="popup-grid">
         <span>Busy utilization</span><strong>${formatPercent(station.busy_percent)}</strong>
+        <span>Observed coverage</span><strong>${formatPercent(station.coverage_percent)}</strong>
         <span>Busy station-hours</span><strong>${formatNumber(station.busy_hours, 2)}</strong>
         <span>Charging connector-hours</span><strong>${formatNumber(station.charging_connector_hours, 2)}</strong>
         <span>Scenario revenue</span><strong>${formatMoney(station.scenario_revenue_amd)}</strong>
@@ -398,6 +410,7 @@ function areaPopup(area, metricKey) {
       <div class="popup-grid">
         <span>${escapeHtml(metric.shortLabel)}</span><strong>${metric.format(area[metricKey] || 0)}</strong>
         <span>Busy utilization</span><strong>${formatPercent(area.busy_percent)}</strong>
+        <span>Observed coverage</span><strong>${formatPercent(area.coverage_percent)}</strong>
         <span>Busy station-hours</span><strong>${formatNumber(area.busy_hours, 2)}</strong>
         <span>Currently busy</span><strong>${formatInteger(area.current_busy_stations)}</strong>
         <span>Top busy station</span><strong>${escapeHtml(area.top_station_name || "—")}</strong>
