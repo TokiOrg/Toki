@@ -1,0 +1,175 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <meta name="description" content="Team Energy station utilization and geographic busy-area analytics">
+    <title>Team Energy Analytics</title>
+    <link
+      rel="stylesheet"
+      href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css"
+    >
+    <link rel="stylesheet" href="/static/dashboard.css">
+  </head>
+  <body>
+    <header class="app-header">
+      <div>
+        <p class="eyebrow">PRIVATE OPERATIONS VIEW</p>
+        <h1>Team Energy station analytics</h1>
+        <p class="header-subtitle">Where demand concentrates, which stations stay busy, and what the observed charging time could imply.</p>
+      </div>
+      <div class="freshness" aria-live="polite">
+        <span class="live-dot" aria-hidden="true"></span>
+        <div>
+          <span>Latest successful poll</span>
+          <strong id="last-poll">Loading…</strong>
+        </div>
+      </div>
+    </header>
+
+    <main>
+      <section class="control-bar" aria-label="Dashboard filters">
+        <label>
+          <span>Observation window</span>
+          <select id="hours-filter">
+            <option value="1">Last hour</option>
+            <option value="6">Last 6 hours</option>
+            <option value="24" selected>Last 24 hours</option>
+            <option value="72">Last 3 days</option>
+            <option value="168">Last 7 days</option>
+            <option value="0">All collected data</option>
+          </select>
+        </label>
+        <label>
+          <span>Map and ranking metric</span>
+          <select id="metric-filter">
+            <option value="busy_hours" selected>Busy station-hours</option>
+            <option value="busy_percent">Busy utilization</option>
+            <option value="charging_connector_hours">Charging connector-hours</option>
+            <option value="scenario_revenue_amd">Scenario revenue (AMD)</option>
+          </select>
+        </label>
+        <label>
+          <span>Current status</span>
+          <select id="status-filter">
+            <option value="all" selected>All statuses</option>
+            <option value="available">Available</option>
+            <option value="busy">Busy</option>
+            <option value="maintenance">Maintenance</option>
+            <option value="unknown">Unknown</option>
+          </select>
+        </label>
+        <label class="search-control">
+          <span>Find a station</span>
+          <input id="station-search" type="search" placeholder="Name or address" autocomplete="off">
+        </label>
+        <button id="refresh-button" type="button">Refresh data</button>
+      </section>
+
+      <div id="error-banner" class="error-banner" role="alert" hidden></div>
+
+      <section class="kpi-grid" aria-label="Portfolio summary">
+        <article class="kpi-card">
+          <p>Stations monitored</p>
+          <strong id="kpi-stations">—</strong>
+          <span id="kpi-status-context">Current network</span>
+        </article>
+        <article class="kpi-card">
+          <p>Busy utilization</p>
+          <strong id="kpi-busy-percent">—</strong>
+          <span id="kpi-busy-hours">— busy station-hours</span>
+        </article>
+        <article class="kpi-card">
+          <p>Charging time</p>
+          <strong id="kpi-charging-hours">—</strong>
+          <span>Connector-hours marked charging</span>
+        </article>
+        <article class="kpi-card kpi-card-caution">
+          <p>Scenario revenue</p>
+          <strong id="kpi-revenue">—</strong>
+          <span id="kpi-revenue-context">Planning estimate, not receipts</span>
+        </article>
+        <article class="kpi-card">
+          <p>Observed coverage</p>
+          <strong id="kpi-coverage">—</strong>
+          <span id="kpi-window">Selected data window</span>
+        </article>
+      </section>
+
+      <section class="dashboard-grid">
+        <article class="panel map-panel">
+          <div class="panel-heading">
+            <div>
+              <p class="section-label">GEOGRAPHIC DEMAND</p>
+              <h2>Busiest sections and current station status</h2>
+              <p id="map-subtitle">Grid intensity shows total busy station-hours. Marker color shows current status.</p>
+            </div>
+            <div class="layer-switch" role="group" aria-label="Map layers">
+              <button type="button" data-layer="both" class="active">Both</button>
+              <button type="button" data-layer="areas">Sections</button>
+              <button type="button" data-layer="stations">Stations</button>
+            </div>
+          </div>
+          <div id="map" aria-label="Interactive map of Team Energy stations"></div>
+          <div class="map-legend" aria-label="Map legend">
+            <div><span class="legend-dot status-available"></span>Available</div>
+            <div><span class="legend-dot status-busy"></span>Busy</div>
+            <div><span class="legend-dot status-maintenance"></span>Maintenance</div>
+            <div><span class="legend-dot status-unknown"></span>Unknown</div>
+            <div class="intensity-key"><span>Lower section intensity</span><span class="intensity-ramp"></span><span>Higher</span></div>
+          </div>
+        </article>
+
+        <article class="panel ranking-panel">
+          <div class="panel-heading">
+            <div>
+              <p class="section-label">STATION RANKING</p>
+              <h2 id="ranking-title">Top stations by busy hours</h2>
+              <p id="ranking-subtitle">Midpoint-estimated time in the selected window.</p>
+            </div>
+          </div>
+          <div id="ranking-chart" class="ranking-chart" aria-live="polite"></div>
+        </article>
+      </section>
+
+      <section class="panel table-panel">
+        <div class="panel-heading table-heading">
+          <div>
+            <p class="section-label">STATION DETAIL</p>
+            <h2>Compare and locate stations</h2>
+            <p id="table-subtitle">Sorted by busy station-hours; select a row to locate it on the map.</p>
+          </div>
+          <span id="visible-station-count" class="row-count">— stations</span>
+        </div>
+        <div class="table-scroll">
+          <table>
+            <thead>
+              <tr>
+                <th>Station</th>
+                <th>Current status</th>
+                <th class="number">Busy %</th>
+                <th class="number">Busy hours</th>
+                <th class="number">Charging hours</th>
+                <th class="number">Scenario revenue</th>
+                <th class="number">Available now</th>
+              </tr>
+            </thead>
+            <tbody id="station-table-body"></tbody>
+          </table>
+        </div>
+      </section>
+
+      <section class="methodology-note">
+        <strong>How to read this:</strong>
+        status duration uses the midpoint between the last poll with the old status and the first poll with the new status. Geographic sections aggregate a 0.025° grid. Scenario revenue uses only connector intervals marked <em>charging</em>, rated power, the provider price field, and a <span id="load-factor-note">50%</span> load factor. It is not actual collected revenue.
+      </section>
+    </main>
+
+    <script
+      src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"
+      integrity="sha256-20nQCchB9co0qIjJZRGuk2/Z9VM+kNiyxNV1lvTlZBo="
+      crossorigin=""
+    ></script>
+    <script src="/static/dashboard.js" defer></script>
+  </body>
+</html>

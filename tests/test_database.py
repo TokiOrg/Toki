@@ -1,0 +1,200 @@
+from __future__ import annotations
+
+from datetime import datetime, timedelta, timezone
+import io
+import math
+import zipfile
+
+from team_energy_service.database import Database
+from team_energy_service.provider import normalize_snapshot
+
+
+def raw_snapshot(connector_status: int) -> list[dict]:
+    descriptions = {
+        1: "Available",
+        2: "Busy",
+        4: "Maintenance",
+        6: "Charging",
+    }
+    return [
+        {
+            "chargeStationId": "station-1",
+            "name": "Test Station",
+            "address": "Test Address",
+            "latitude": 40.1,
+            "longitude": 44.5,
+            "isPublic": True,
+            "status": "1",
+            "chargePointInfos": [
+                {
+                    "chargePointId": "evse-1",
+                    "stationName": "Test EVSE",
+                    "connectors": [
+                        {
+                            "connectorId": "connector-1",
+                            "key": "connector-key",
+                            "connectorNumber": 1,
+                            "connectorType": "CCS2",
+                            "connectorTypeGroup": "DC",
+                            "power": 120,
+                            "price": 100,
+                            "status": connector_status,
+                            "statusDescription": descriptions[connector_status],
+                            "stateOfBattery": 0,
+                            "isPrepairing": False,
+                        }
+                    ],
+                }
+            ],
+        }
+    ]
+
+
+def test_unchanged_polls_do_not_create_duplicate_intervals(tmp_path):
+    database = Database(tmp_path / "history.duckdb")
+    database.initialize()
+    started = datetime(2026, 8, 5, 10, 0, tzinfo=timezone.utc)
+
+    first = database.record_snapshot(normalize_snapshot(raw_snapshot(1), started))
+    second = database.record_snapshot(
+        normalize_snapshot(raw_snapshot(1), started + timedelta(seconds=30))
+    )
+
+    assert first["connector_changes"] == 1
+    assert first["station_changes"] == 1
+    assert second["connector_changes"] == 0
+    assert second["station_changes"] == 0
+    health = database.health()
+    assert health["connector_interval_count"] == 1
+    assert health["station_interval_count"] == 1
+    assert health["poll_count"] == 2
+    history = database.connector_history("connector-1", 24 * 366)
+    assert history[0]["last_confirmed_at"] == started + timedelta(seconds=30)
+
+
+def test_status_change_closes_old_intervals_with_observation_bounds(tmp_path):
+    database = Database(tmp_path / "history.duckdb")
+    database.initialize()
+    first_at = datetime(2026, 8, 5, 10, 0, tzinfo=timezone.utc)
+    confirmed_at = first_at + timedelta(seconds=30)
+    changed_at = first_at + timedelta(seconds=60)
+
+    database.record_snapshot(normalize_snapshot(raw_snapshot(1), first_at))
+    database.record_snapshot(normalize_snapshot(raw_snapshot(1), confirmed_at))
+    result = database.record_snapshot(normalize_snapshot(raw_snapshot(6), changed_at))
+
+    assert result["connector_changes"] == 1
+    assert result["station_changes"] == 1
+    connector_history = database.connector_history("connector-1", 24 * 366)
+    assert [row["status"] for row in connector_history] == ["charging", "available"]
+    assert connector_history[1]["last_confirmed_at"] == confirmed_at
+    assert connector_history[1]["ended_at"] == changed_at
+    station_history = database.station_history("station-1", 24 * 366)
+    assert [row["status"] for row in station_history] == ["busy", "available"]
+
+
+def test_complete_database_export_contains_excel_compatible_csvs(tmp_path):
+    database = Database(tmp_path / "history.duckdb")
+    database.initialize()
+    database.record_snapshot(
+        normalize_snapshot(
+            raw_snapshot(1),
+            datetime(2026, 8, 5, 10, 0, tzinfo=timezone.utc),
+        )
+    )
+
+    filename, content, counts = database.export_csv_archive()
+
+    assert filename.startswith("team_energy_all_data_")
+    assert filename.endswith(".zip")
+    assert counts["stations"] == 1
+    assert counts["connectors"] == 1
+    with zipfile.ZipFile(io.BytesIO(content)) as archive:
+        assert set(archive.namelist()) == {
+            "stations.csv",
+            "connectors.csv",
+            "station_status_intervals.csv",
+            "connector_status_intervals.csv",
+            "collector_state.csv",
+            "README.txt",
+        }
+        assert archive.read("stations.csv").startswith(b"\xef\xbb\xbf")
+        assert b"Test Station" in archive.read("stations.csv")
+
+
+def test_analytics_use_midpoint_intervals_and_charging_only_for_revenue(tmp_path):
+    database = Database(tmp_path / "analytics.duckdb")
+    database.initialize()
+    started = datetime(2026, 8, 5, 10, 0, tzinfo=timezone.utc)
+    observations = [
+        (0, 1),
+        (30, 1),
+        (60, 6),
+        (90, 6),
+        (120, 1),
+    ]
+    for seconds, status in observations:
+        database.record_snapshot(
+            normalize_snapshot(
+                raw_snapshot(status),
+                started + timedelta(seconds=seconds),
+            )
+        )
+
+    payload = database.analytics_payload()
+    analytics = payload["station_analytics"][0]
+
+    assert analytics["station_name"] == "Test Station"
+    assert math.isclose(analytics["busy_hours"], 60 / 3600, abs_tol=1e-6)
+    assert math.isclose(
+        analytics["charging_connector_hours"], 60 / 3600, abs_tol=1e-6
+    )
+    assert math.isclose(
+        analytics["rated_energy_ceiling_kwh"], 2.0, abs_tol=1e-5
+    )
+    assert math.isclose(
+        analytics["rated_power_revenue_ceiling_amd"], 200.0, abs_tol=1e-4
+    )
+    assert math.isclose(analytics["scenario_revenue_amd"], 100.0, abs_tol=1e-4)
+    assert [row["status"] for row in payload["station_history"]] == [
+        "available",
+        "busy",
+        "available",
+    ]
+    assert payload["station_history"][1]["transition_uncertainty_minutes"] == 0.5
+    assert all(
+        row["metadata_basis"] == "observed_at_interval_start"
+        for row in payload["connector_history"]
+    )
+
+
+def test_analytics_archive_keeps_workbook_readable_csvs_and_raw_data(
+    tmp_path, monkeypatch
+):
+    database = Database(tmp_path / "analytics-export.duckdb")
+    database.initialize()
+    database.record_snapshot(
+        normalize_snapshot(
+            raw_snapshot(1),
+            datetime(2026, 8, 5, 10, 0, tzinfo=timezone.utc),
+        )
+    )
+    monkeypatch.setattr(
+        "team_energy_service.database.build_analytics_workbook",
+        lambda payload: b"fake-xlsx",
+    )
+
+    filename, content, counts = database.export_analytics_archive()
+
+    assert filename.startswith("team_energy_analytics_and_raw_")
+    assert counts["station_analytics"] == 1
+    with zipfile.ZipFile(io.BytesIO(content)) as archive:
+        names = set(archive.namelist())
+        assert any(name.endswith(".xlsx") for name in names)
+        assert "station_analytics.csv" in names
+        assert "readable_station_history.csv" in names
+        assert "readable_connector_history.csv" in names
+        assert "stations.csv" in names
+        assert "connector_status_intervals.csv" in names
+        assert b"Test Station" in archive.read("station_analytics.csv")
+        assert b"scenario_revenue_amd" in archive.read("station_analytics.csv")
