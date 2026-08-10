@@ -33,6 +33,8 @@ def _format_key(key: str) -> str | None:
         or lowered in {"observation_start", "observation_end"}
     ):
         return "date"
+    if "battery" in lowered:
+        return "whole_percent"
     if "percent" in lowered or "load_factor" in lowered:
         return "percent"
     if "latitude" in lowered or "longitude" in lowered:
@@ -121,6 +123,7 @@ class WorkbookBuilder:
         sheet_names = [
             "Dashboard",
             "Station Analytics",
+            "Connector Summary",
             "Readable History",
             "Connector History",
             "Methodology",
@@ -177,6 +180,7 @@ class WorkbookBuilder:
             ),
             "date": add({"num_format": "yyyy-mm-dd hh:mm:ss"}),
             "percent": add({"num_format": "0.0%"}),
+            "whole_percent": add({"num_format": '0.0"%"'}),
             "coordinate": add({"num_format": "0.000000"}),
             "currency": add({"num_format": "#,##0"}),
             "decimal": add({"num_format": "0.00"}),
@@ -560,6 +564,80 @@ class WorkbookBuilder:
                 },
             )
 
+    def build_connector_summary(self) -> None:
+        columns = [
+            ("station_name", "Station Name"),
+            ("address", "Address"),
+            ("evse_name", "EVSE Name"),
+            ("connector_number", "Connector #"),
+            ("connector_type", "Connector Type"),
+            ("connector_type_group", "Type Group"),
+            ("current_status", "Current Status"),
+            ("power_kw", "Rated Power (kW)"),
+            ("price", "Price Field (AMD/kWh)"),
+            ("observation_start", "Observation Start"),
+            ("observation_end", "Observation End"),
+            ("observed_connector_hours", "Observed Hours"),
+            ("known_connector_hours", "Known Hours"),
+            ("available_hours", "Available Hours"),
+            ("busy_hours", "Busy Hours"),
+            ("charging_hours", "Charging Hours"),
+            ("maintenance_hours", "Maintenance Hours"),
+            ("unknown_hours", "Unknown Hours"),
+            ("coverage_percent", "Coverage %"),
+            ("busy_percent", "Busy %"),
+            ("availability_percent", "Availability %"),
+            ("charging_percent", "Charging %"),
+            ("cars_served", "Cars Served"),
+            ("charging_connector_hours", "Charging Hours (Sessions)"),
+            ("rated_energy_ceiling_kwh", "Rated Energy Ceiling (kWh)"),
+            ("energy_weighted_price", "Weighted Price (AMD/kWh)"),
+            ("scenario_energy_kwh", "Scenario Energy (kWh)"),
+            ("scenario_revenue_amd", "Scenario Revenue (AMD)"),
+            ("rated_power_revenue_ceiling_amd", "Full-Power Revenue Ceiling (AMD)"),
+            ("avg_battery_in_percent", "Avg Battery In %"),
+            ("avg_battery_out_percent", "Avg Battery Out %"),
+            ("avg_battery_delta_percent", "Avg Battery Gain %"),
+            ("transition_uncertainty_minutes", "Transition Uncertainty (min)"),
+            ("connector_id", "Connector ID"),
+            ("station_id", "Station ID"),
+        ]
+        rows = self.payload["connector_analytics"]
+        sheet = self.add_sheet("Connector Summary")
+        self.write_table_sheet(
+            sheet,
+            columns,
+            rows,
+            "ConnectorSummaryTable",
+            wrap_keys={"station_name", "address", "evse_name"},
+            data_row_height=34,
+        )
+        if rows:
+            last_row = len(rows)
+            status_column = next(
+                index
+                for index, (key, _) in enumerate(columns)
+                if key == "current_status"
+            )
+            for value, status_format in (
+                ("available", self.formats["status_available"]),
+                ("busy", self.formats["status_busy"]),
+                ("charging", self.formats["status_busy"]),
+                ("maintenance", self.formats["status_maintenance"]),
+            ):
+                sheet.conditional_format(
+                    1,
+                    status_column,
+                    last_row,
+                    status_column,
+                    {
+                        "type": "text",
+                        "criteria": "containing",
+                        "value": value,
+                        "format": status_format,
+                    },
+                )
+
     def build_history_sheets(self) -> None:
         station_columns = [
             ("station_name", "Station Name"),
@@ -801,6 +879,7 @@ class WorkbookBuilder:
     def build(self) -> bytes:
         self.build_methodology()
         self.build_station_analytics()
+        self.build_connector_summary()
         self.build_history_sheets()
         self.build_raw_sheets()
         self.build_dashboard()
