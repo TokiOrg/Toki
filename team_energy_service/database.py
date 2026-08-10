@@ -75,6 +75,8 @@ CREATE TABLE IF NOT EXISTS connector_status_intervals (
     power_kw DOUBLE,
     price DOUBLE,
     metadata_basis VARCHAR,
+    battery_at_start DOUBLE,
+    battery_at_end DOUBLE,
     started_at TIMESTAMPTZ NOT NULL,
     last_confirmed_at TIMESTAMPTZ NOT NULL,
     ended_at TIMESTAMPTZ,
@@ -155,6 +157,14 @@ class Database:
             connection.execute(
                 "ALTER TABLE connector_status_intervals "
                 "ADD COLUMN IF NOT EXISTS metadata_basis VARCHAR"
+            )
+            connection.execute(
+                "ALTER TABLE connector_status_intervals "
+                "ADD COLUMN IF NOT EXISTS battery_at_start DOUBLE"
+            )
+            connection.execute(
+                "ALTER TABLE connector_status_intervals "
+                "ADD COLUMN IF NOT EXISTS battery_at_end DOUBLE"
             )
             connection.execute(
                 """
@@ -423,6 +433,7 @@ class Database:
                     [*values, snapshot.observed_at, connector_id],
                 )
 
+            battery = connector.get("state_of_battery")
             open_interval = open_intervals.get(connector_id)
             if open_interval is None:
                 connection.execute(
@@ -430,8 +441,12 @@ class Database:
                     INSERT INTO connector_status_intervals (
                         connector_id, station_id, status_code, status,
                         status_description, power_kw, price, metadata_basis,
+                        battery_at_start, battery_at_end,
                         started_at, last_confirmed_at, ended_at
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, 'observed_at_interval_start', ?, ?, NULL)
+                    ) VALUES (
+                        ?, ?, ?, ?, ?, ?, ?, 'observed_at_interval_start',
+                        ?, ?, ?, ?, NULL
+                    )
                     """,
                     [
                         connector_id,
@@ -441,6 +456,8 @@ class Database:
                         connector.get("status_description"),
                         connector.get("power_kw"),
                         connector.get("price"),
+                        battery,
+                        battery,
                         snapshot.observed_at,
                         snapshot.observed_at,
                     ],
@@ -460,8 +477,12 @@ class Database:
                     INSERT INTO connector_status_intervals (
                         connector_id, station_id, status_code, status,
                         status_description, power_kw, price, metadata_basis,
+                        battery_at_start, battery_at_end,
                         started_at, last_confirmed_at, ended_at
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, 'observed_at_interval_start', ?, ?, NULL)
+                    ) VALUES (
+                        ?, ?, ?, ?, ?, ?, ?, 'observed_at_interval_start',
+                        ?, ?, ?, ?, NULL
+                    )
                     """,
                     [
                         connector_id,
@@ -471,11 +492,23 @@ class Database:
                         connector.get("status_description"),
                         connector.get("power_kw"),
                         connector.get("price"),
+                        battery,
+                        battery,
                         snapshot.observed_at,
                         snapshot.observed_at,
                     ],
                 )
                 changes += 1
+            elif battery is not None:
+                connection.execute(
+                    """
+                    UPDATE connector_status_intervals
+                    SET battery_at_end = ?,
+                        battery_at_start = coalesce(battery_at_start, ?)
+                    WHERE connector_id = ? AND ended_at IS NULL
+                    """,
+                    [battery, battery, connector_id],
+                )
         return changes
 
     def _record_stations(
@@ -791,6 +824,212 @@ class Database:
                 [connector_id, cutoff_at],
             )
 
+    @staticmethod
+    def _build_connector_analytics(
+        connector_rows: list[dict[str, Any]],
+        station_metrics: dict[str, dict[str, Any]],
+        connector_history: list[dict[str, Any]],
+    ) -> list[dict[str, Any]]:
+        """Per-connector decision metrics, mirroring the station analytics.
+
+        Sessions served is the count of charging intervals for the connector.
+        Battery-in/out is averaged across charging sessions that recorded a
+        reading; it is only populated for sessions collected after the battery
+        columns were deployed, so older sessions leave it blank.
+        """
+        scenario_load_factor = 0.5
+        metrics: dict[str, dict[str, Any]] = {}
+        for connector in connector_rows:
+            connector_id = connector["connector_id"]
+            station_id = connector.get("station_id")
+            station = station_metrics.get(station_id, {})
+            metrics[connector_id] = {
+                "station_name": station.get("station_name") or station_id,
+                "address": station.get("address"),
+                "evse_name": connector.get("evse_name"),
+                "connector_number": connector.get("connector_number"),
+                "connector_type": connector.get("connector_type"),
+                "connector_type_group": connector.get("connector_type_group"),
+                "current_status": connector.get("status"),
+                "power_kw": connector.get("power_kw"),
+                "price": connector.get("price"),
+                "observation_start": None,
+                "observation_end": None,
+                "available_hours": 0.0,
+                "busy_hours": 0.0,
+                "charging_hours": 0.0,
+                "maintenance_hours": 0.0,
+                "unknown_hours": 0.0,
+                "observed_connector_hours": 0.0,
+                "known_connector_hours": 0.0,
+                "coverage_percent": 0.0,
+                "busy_percent": 0.0,
+                "availability_percent": 0.0,
+                "charging_percent": 0.0,
+                "cars_served": 0,
+                "charging_connector_hours": 0.0,
+                "rated_energy_ceiling_kwh": 0.0,
+                "energy_weighted_price": None,
+                "scenario_energy_kwh": 0.0,
+                "scenario_revenue_amd": 0.0,
+                "rated_power_revenue_ceiling_amd": 0.0,
+                "avg_battery_in_percent": None,
+                "avg_battery_out_percent": None,
+                "avg_battery_delta_percent": None,
+                "transition_uncertainty_minutes": 0.0,
+                "connector_id": connector_id,
+                "station_id": station_id,
+                "_price_numerator": 0.0,
+                "_battery_in_sum": 0.0,
+                "_battery_in_count": 0,
+                "_battery_out_sum": 0.0,
+                "_battery_out_count": 0,
+            }
+
+        for interval in connector_history:
+            metric = metrics.get(interval["connector_id"])
+            if metric is None:
+                continue
+            status = interval.get("status")
+            duration = float(interval.get("midpoint_estimated_hours") or 0)
+            hours_key = f"{status}_hours"
+            if hours_key not in metric:
+                hours_key = "unknown_hours"
+            metric[hours_key] += duration
+            metric["transition_uncertainty_minutes"] += float(
+                interval.get("transition_uncertainty_minutes") or 0
+            )
+            estimated_start = interval.get("estimated_started_at")
+            estimated_end = interval.get("estimated_ended_at")
+            if estimated_start is not None and (
+                metric["observation_start"] is None
+                or estimated_start < metric["observation_start"]
+            ):
+                metric["observation_start"] = estimated_start
+            if estimated_end is not None and (
+                metric["observation_end"] is None
+                or estimated_end > metric["observation_end"]
+            ):
+                metric["observation_end"] = estimated_end
+
+            if status == "charging":
+                power_kw = float(interval.get("power_kw") or 0)
+                price = float(interval.get("price") or 0)
+                rated_energy = duration * power_kw
+                metric["cars_served"] += 1
+                metric["charging_connector_hours"] += duration
+                metric["rated_energy_ceiling_kwh"] += rated_energy
+                metric["rated_power_revenue_ceiling_amd"] += rated_energy * price
+                metric["_price_numerator"] += rated_energy * price
+                battery_in = interval.get("battery_at_start")
+                battery_out = interval.get("battery_at_end")
+                if battery_in is not None:
+                    metric["_battery_in_sum"] += float(battery_in)
+                    metric["_battery_in_count"] += 1
+                if battery_out is not None:
+                    metric["_battery_out_sum"] += float(battery_out)
+                    metric["_battery_out_count"] += 1
+
+        connector_analytics = list(metrics.values())
+        for metric in connector_analytics:
+            observed = sum(
+                float(metric[key])
+                for key in (
+                    "available_hours",
+                    "busy_hours",
+                    "charging_hours",
+                    "maintenance_hours",
+                    "unknown_hours",
+                )
+            )
+            known = observed - float(metric["unknown_hours"])
+            metric["observed_connector_hours"] = observed
+            metric["known_connector_hours"] = known
+            metric["coverage_percent"] = known / observed if observed else 0.0
+            metric["busy_percent"] = (
+                (float(metric["busy_hours"]) + float(metric["charging_hours"]))
+                / known
+                if known
+                else 0.0
+            )
+            metric["availability_percent"] = (
+                float(metric["available_hours"]) / known if known else 0.0
+            )
+            metric["charging_percent"] = (
+                float(metric["charging_hours"]) / known if known else 0.0
+            )
+            energy = metric["rated_energy_ceiling_kwh"]
+            if energy > 0:
+                metric["energy_weighted_price"] = metric["_price_numerator"] / energy
+            metric["scenario_energy_kwh"] = (
+                metric["rated_energy_ceiling_kwh"] * scenario_load_factor
+            )
+            metric["scenario_revenue_amd"] = (
+                metric["rated_power_revenue_ceiling_amd"] * scenario_load_factor
+            )
+            if metric["_battery_in_count"]:
+                metric["avg_battery_in_percent"] = (
+                    metric["_battery_in_sum"] / metric["_battery_in_count"]
+                )
+            if metric["_battery_out_count"]:
+                metric["avg_battery_out_percent"] = (
+                    metric["_battery_out_sum"] / metric["_battery_out_count"]
+                )
+            if (
+                metric["avg_battery_in_percent"] is not None
+                and metric["avg_battery_out_percent"] is not None
+            ):
+                metric["avg_battery_delta_percent"] = (
+                    metric["avg_battery_out_percent"]
+                    - metric["avg_battery_in_percent"]
+                )
+            for key in (
+                "available_hours",
+                "busy_hours",
+                "charging_hours",
+                "maintenance_hours",
+                "unknown_hours",
+                "observed_connector_hours",
+                "known_connector_hours",
+                "coverage_percent",
+                "busy_percent",
+                "availability_percent",
+                "charging_percent",
+                "charging_connector_hours",
+                "rated_energy_ceiling_kwh",
+                "rated_power_revenue_ceiling_amd",
+                "scenario_energy_kwh",
+                "scenario_revenue_amd",
+                "transition_uncertainty_minutes",
+            ):
+                metric[key] = round(float(metric[key]), 6)
+            for key in (
+                "energy_weighted_price",
+                "avg_battery_in_percent",
+                "avg_battery_out_percent",
+                "avg_battery_delta_percent",
+            ):
+                if metric[key] is not None:
+                    metric[key] = round(float(metric[key]), 6)
+            for helper_key in (
+                "_price_numerator",
+                "_battery_in_sum",
+                "_battery_in_count",
+                "_battery_out_sum",
+                "_battery_out_count",
+            ):
+                metric.pop(helper_key, None)
+
+        connector_analytics.sort(
+            key=lambda metric: (
+                -metric["charging_connector_hours"],
+                -metric["busy_hours"],
+                metric["station_name"] or "",
+                metric["connector_id"],
+            )
+        )
+        return connector_analytics
+
     def analytics_payload(self) -> dict[str, Any]:
         """Build readable status history and station-level decision metrics."""
         generated_at = datetime.now(timezone.utc)
@@ -952,6 +1191,8 @@ class Database:
                     power_kw,
                     price,
                     metadata_basis,
+                    battery_at_start,
+                    battery_at_end,
                     started_at AS first_observed_at,
                     effective_last_confirmed_at AS last_confirmed_at,
                     ended_at AS next_status_observed_at,
@@ -1068,6 +1309,12 @@ class Database:
             metric["rated_power_revenue_ceiling_amd"] += rated_energy * price
             price_numerators[interval["station_id"]] += rated_energy * price
 
+        connector_analytics = self._build_connector_analytics(
+            raw_tables["connectors"],
+            station_metrics,
+            connector_history,
+        )
+
         station_analytics = list(station_metrics.values())
         for metric in station_analytics:
             observed_hours = sum(
@@ -1161,6 +1408,7 @@ class Database:
                 "gap_threshold_seconds": self.gap_threshold_seconds,
             },
             "station_analytics": station_analytics,
+            "connector_analytics": connector_analytics,
             "station_history": station_history,
             "connector_history": connector_history,
             "raw_tables": raw_tables,
@@ -1483,6 +1731,7 @@ class Database:
         timestamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
         row_counts = {
             "station_analytics": len(payload["station_analytics"]),
+            "connector_analytics": len(payload["connector_analytics"]),
             "station_history": len(payload["station_history"]),
             "connector_history": len(payload["connector_history"]),
             **{
@@ -1501,6 +1750,10 @@ class Database:
             archive.writestr(
                 "station_analytics.csv",
                 self._csv_bytes(payload["station_analytics"]),
+            )
+            archive.writestr(
+                "connector_analytics.csv",
+                self._csv_bytes(payload["connector_analytics"]),
             )
             archive.writestr(
                 "readable_station_history.csv",
