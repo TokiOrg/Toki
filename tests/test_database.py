@@ -312,3 +312,70 @@ def test_long_collection_gap_is_recorded_as_unknown_and_excluded_from_utilizatio
     health = database.health()
     assert health["collector_gap_count"] == 1
     assert health["latest_collector_gap"]["gap_id"] == gaps[0]["gap_id"]
+
+
+def _battery_snapshot(connector_status: int, battery):
+    payload = raw_snapshot(connector_status)
+    payload[0]["chargePointInfos"][0]["connectors"][0]["stateOfBattery"] = battery
+    return payload
+
+
+def test_connector_analytics_report_sessions_revenue_and_battery(tmp_path):
+    database = Database(tmp_path / "history.duckdb")
+    database.initialize()
+    started = datetime(2026, 8, 10, 9, 0, tzinfo=timezone.utc)
+
+    # available -> charging (20% -> 55% -> 80%) -> available
+    sequence = [(1, None), (6, 20), (6, 55), (6, 80), (1, None)]
+    for index, (status_code, battery) in enumerate(sequence):
+        database.record_snapshot(
+            normalize_snapshot(
+                _battery_snapshot(status_code, battery),
+                started + timedelta(seconds=30 * index),
+            )
+        )
+
+    payload = database.analytics_payload()
+    assert "connector_analytics" in payload
+    connectors = payload["connector_analytics"]
+    assert len(connectors) == 1
+    connector = connectors[0]
+
+    # Identity / location fields are carried through from the station join.
+    assert connector["station_name"] == "Test Station"
+    assert connector["address"] == "Test Address"
+    assert connector["connector_type"] == "CCS2"
+    assert connector["connector_id"] == "connector-1"
+
+    # One charging interval == one car served.
+    assert connector["cars_served"] == 1
+
+    # Battery captured at interval start and latest reading at close.
+    assert math.isclose(connector["avg_battery_in_percent"], 20.0, abs_tol=1e-6)
+    assert math.isclose(connector["avg_battery_out_percent"], 80.0, abs_tol=1e-6)
+    assert math.isclose(connector["avg_battery_delta_percent"], 60.0, abs_tol=1e-6)
+
+    # Scenario revenue = rated energy ceiling * price * load factor (0.5).
+    assert connector["scenario_revenue_amd"] > 0
+    assert math.isclose(
+        connector["scenario_revenue_amd"],
+        connector["rated_power_revenue_ceiling_amd"] * 0.5,
+        abs_tol=1e-6,
+    )
+
+
+def test_connector_summary_sheet_present_in_workbook(tmp_path):
+    database = Database(tmp_path / "history.duckdb")
+    database.initialize()
+    started = datetime(2026, 8, 10, 9, 0, tzinfo=timezone.utc)
+    for index, status_code in enumerate((1, 6, 1)):
+        database.record_snapshot(
+            normalize_snapshot(
+                raw_snapshot(status_code), started + timedelta(seconds=30 * index)
+            )
+        )
+
+    workbook_bytes = build_analytics_workbook(database.analytics_payload())
+    with zipfile.ZipFile(io.BytesIO(workbook_bytes)) as archive:
+        workbook_xml = archive.read("xl/workbook.xml").decode("utf-8")
+    assert "Connector Summary" in workbook_xml
