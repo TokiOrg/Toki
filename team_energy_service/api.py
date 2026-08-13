@@ -173,6 +173,21 @@ def create_app(
     async def telegram_status(request: Request) -> dict:
         return request.app.state.telegram.public_status()
 
+    @app.get("/debug/raw-sample")
+    async def debug_raw_sample(request: Request) -> dict:
+        """Return one raw station+connector exactly as the Team Energy API sends
+        it, so every available field (including any metered energy/kWh not
+        currently parsed) can be inspected. Requires the shared web credentials.
+        """
+        provider = request.app.state.poller.provider
+        sample = getattr(provider, "last_raw_sample", None)
+        if sample is None:
+            return {
+                "available": False,
+                "detail": "No raw sample captured yet; wait for the next poll.",
+            }
+        return {"available": True, "raw_station": sample}
+
     @app.get("/collector/gaps")
     async def collector_gaps(
         request: Request,
