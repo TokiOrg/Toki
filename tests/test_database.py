@@ -379,3 +379,27 @@ def test_connector_summary_sheet_present_in_workbook(tmp_path):
     with zipfile.ZipFile(io.BytesIO(workbook_bytes)) as archive:
         workbook_xml = archive.read("xl/workbook.xml").decode("utf-8")
     assert "Connector Summary" in workbook_xml
+
+
+def test_battery_in_uses_first_nonzero_reading_not_plugin_zero(tmp_path):
+    """Provider reports 0 at plug-in (unknown SOC); battery_in should capture
+    the first real reading that appears later, not the placeholder 0."""
+    database = Database(tmp_path / "history.duckdb")
+    database.initialize()
+    started = datetime(2026, 8, 12, 9, 0, tzinfo=timezone.utc)
+
+    # Plug in reporting 0 (unknown), then real readings 40 -> 70 -> 90, then unplug
+    sequence = [(1, 0), (6, 0), (6, 40), (6, 70), (6, 90), (1, 0)]
+    for index, (status_code, battery) in enumerate(sequence):
+        database.record_snapshot(
+            normalize_snapshot(
+                _battery_snapshot(status_code, battery),
+                started + timedelta(seconds=30 * index),
+            )
+        )
+
+    connector = database.analytics_payload()["connector_analytics"][0]
+    # First real reading was 40, not the plug-in 0
+    assert math.isclose(connector["avg_battery_in_percent"], 40.0, abs_tol=1e-6)
+    assert math.isclose(connector["avg_battery_out_percent"], 90.0, abs_tol=1e-6)
+    assert math.isclose(connector["avg_battery_delta_percent"], 50.0, abs_tol=1e-6)
