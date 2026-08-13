@@ -499,12 +499,21 @@ class Database:
                     ],
                 )
                 changes += 1
-            elif battery is not None:
+            elif battery is not None and battery > 0:
+                # The provider reports 0 when state-of-charge is unavailable
+                # (common at plug-in before the DC handshake reports SOC, and
+                # always on AC). Treat 0 as "no reading": capture battery_at_start
+                # as the FIRST real (non-zero) value seen during the session, and
+                # keep battery_at_end as the latest real value.
                 connection.execute(
                     """
                     UPDATE connector_status_intervals
                     SET battery_at_end = ?,
-                        battery_at_start = coalesce(battery_at_start, ?)
+                        battery_at_start = CASE
+                            WHEN battery_at_start IS NULL OR battery_at_start = 0
+                                THEN ?
+                            ELSE battery_at_start
+                        END
                     WHERE connector_id = ? AND ended_at IS NULL
                     """,
                     [battery, battery, connector_id],
@@ -921,12 +930,14 @@ class Database:
                 metric["rated_energy_ceiling_kwh"] += rated_energy
                 metric["rated_power_revenue_ceiling_amd"] += rated_energy * price
                 metric["_price_numerator"] += rated_energy * price
+                # 0 means the provider had no state-of-charge reading; exclude
+                # it from averages so placeholders don't drag the numbers down.
                 battery_in = interval.get("battery_at_start")
                 battery_out = interval.get("battery_at_end")
-                if battery_in is not None:
+                if battery_in is not None and battery_in > 0:
                     metric["_battery_in_sum"] += float(battery_in)
                     metric["_battery_in_count"] += 1
-                if battery_out is not None:
+                if battery_out is not None and battery_out > 0:
                     metric["_battery_out_sum"] += float(battery_out)
                     metric["_battery_out_count"] += 1
 
