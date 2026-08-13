@@ -56,6 +56,28 @@ def derive_station_status(connector_statuses: list[str]) -> str:
     return "unknown"
 
 
+def _pick_raw_sample(raw_stations: list[dict[str, Any]]) -> dict[str, Any] | None:
+    """Return one raw station dict, preferring one with a charging connector.
+
+    This is only used by the debug endpoint to inspect the API's raw fields.
+    """
+    fallback: dict[str, Any] | None = None
+    for station in raw_stations:
+        if not isinstance(station, dict):
+            continue
+        if fallback is None:
+            fallback = station
+        for charge_point in station.get("chargePointInfos") or []:
+            if not isinstance(charge_point, dict):
+                continue
+            for connector in charge_point.get("connectors") or []:
+                if isinstance(connector, dict) and str(
+                    connector.get("status", "")
+                ) == "6":  # charging
+                    return station
+    return fallback
+
+
 def normalize_snapshot(
     raw_stations: list[dict[str, Any]],
     observed_at: datetime | None = None,
@@ -145,6 +167,10 @@ class TeamEnergyClient:
             },
         )
         self._access_token: str | None = None
+        # Holds the first connector from the most recent raw API response, so an
+        # authenticated debug endpoint can reveal every field the API returns
+        # (used to check whether metered energy/kWh is available but unparsed).
+        self.last_raw_sample: dict[str, Any] | None = None
 
     async def close(self) -> None:
         if self._owns_client:
@@ -215,5 +241,12 @@ class TeamEnergyClient:
             isinstance(station, dict) for station in raw_stations
         ):
             raise TeamEnergyError("Station/Search did not return a station list")
+
+        # Capture one representative raw station (with its raw connectors) so a
+        # debug endpoint can show exactly what fields the API provides. Prefer a
+        # station that currently has a charging connector, since energy/kWh
+        # fields (if any) are most likely present during an active session.
+        self.last_raw_sample = _pick_raw_sample(raw_stations)
+
         return normalize_snapshot(raw_stations)
 
