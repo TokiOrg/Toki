@@ -20,6 +20,33 @@ class Settings:
     telegram_chat_id: int | None = None
     telegram_report_interval_hours: float = 5.0
     telegram_timezone: str = "Asia/Yerevan"
+    # Evan integration is fully opt-in: leave EVAN_PHONE/EVAN_PASSWORD unset
+    # to run exactly as before, with no Evan polling at all.
+    evan_phone: str | None = None
+    evan_password: str | None = None
+    evan_polls_path: Path = Path("data/evan_polls.jsonl")
+    evan_grid_centers: tuple[tuple[float, float], ...] = (
+        # A city/region-spanning grid, not just one tile - the endpoint only
+        # returns stations inside the box you ask for (confirmed: one
+        # Yerevan-center box returned just 14 of what's presumably a larger
+        # national network). Coordinates below cover Yerevan in several
+        # overlapping tiles plus the regional towns Team Energy's data
+        # showed real charging activity in (Sevan, Vayk, Gyumri, Goris,
+        # Dilijan, Vanadzor, Jermuk, Kapan). Add/adjust once you see real
+        # coverage - each tile call costs one extra API request per poll.
+        (40.1776, 44.5126),   # Yerevan center
+        (40.20, 44.52),       # Yerevan north
+        (40.15, 44.48),       # Yerevan south
+        (40.19, 44.47),       # Yerevan west (Tairovi/Kentron area)
+        (40.34, 44.94),       # Sevan
+        (39.71, 45.40),       # Vayk / Vayots Dzor
+        (40.79, 43.85),       # Gyumri
+        (39.51, 46.34),       # Goris
+        (40.74, 44.86),       # Dilijan
+        (40.81, 44.49),       # Vanadzor
+        (39.84, 45.68),       # Jermuk
+        (39.21, 46.41),       # Kapan
+    )
 
     @classmethod
     def from_environment(cls) -> "Settings":
@@ -54,7 +81,24 @@ class Settings:
             telegram_timezone=os.getenv(
                 "TELEGRAM_TIMEZONE", "Asia/Yerevan"
             ).strip(),
+            evan_phone=os.getenv("EVAN_PHONE", "").strip() or None,
+            evan_password=os.getenv("EVAN_PASSWORD", "").strip() or None,
+            evan_polls_path=Path(
+                os.getenv("EVAN_POLLS_PATH", "data/evan_polls.jsonl")
+            ),
         )
+        raw_grid = os.getenv("EVAN_GRID_CENTERS", "").strip()
+        if raw_grid:
+            # Format: "lat,lng;lat,lng;..." - overrides the built-in default
+            # grid without needing a code change/redeploy.
+            centers = []
+            for pair in raw_grid.split(";"):
+                pair = pair.strip()
+                if not pair:
+                    continue
+                lat_str, lng_str = pair.split(",")
+                centers.append((float(lat_str), float(lng_str)))
+            settings = cls(**{**settings.__dict__, "evan_grid_centers": tuple(centers)})
         if settings.poll_interval_seconds < 1:
             raise ValueError("TEAM_ENERGY_POLL_INTERVAL_SECONDS must be at least 1")
         if settings.stale_after_seconds <= 0:
