@@ -16,6 +16,9 @@ from fastapi.staticfiles import StaticFiles
 
 from .config import Settings
 from .database import Database
+from .evan_poller import EvanPoller
+from .evan_provider import EvanClient
+from .evan_store import EvanStore
 from .poller import Poller
 from .provider import TeamEnergyClient
 from .telegram import TelegramService
@@ -46,17 +49,39 @@ def create_app(
         database=database,
     )
 
+    evan_poller: EvanPoller | None = None
+    evan_store: EvanStore | None = None
+    if settings.evan_phone and settings.evan_password:
+        evan_store = EvanStore(settings.evan_polls_path)
+        evan_client = EvanClient(
+            phone=settings.evan_phone,
+            password=settings.evan_password,
+            request_timeout_seconds=settings.request_timeout_seconds,
+        )
+        evan_poller = EvanPoller(
+            client=evan_client,
+            store=evan_store,
+            interval_seconds=settings.poll_interval_seconds,
+            grid_centers=settings.evan_grid_centers,
+        )
+
     @asynccontextmanager
     async def lifespan(app: FastAPI):
         await asyncio.to_thread(database.initialize)
         app.state.database = database
         app.state.poller = poller
         app.state.telegram = telegram
+        app.state.evan_store = evan_store
         polling_task = (
             asyncio.create_task(poller.run(), name="team-energy-poller")
             if start_poller
             else None
         )
+        evan_task = None
+        if evan_poller is not None and evan_store is not None:
+            await asyncio.to_thread(evan_store.initialize)
+            if start_poller:
+                evan_task = asyncio.create_task(evan_poller.run(), name="evan-poller")
         telegram.start()
         try:
             yield
@@ -65,7 +90,13 @@ def create_app(
             await telegram.stop()
             if polling_task:
                 await polling_task
+            if evan_poller is not None:
+                evan_poller.stop()
+            if evan_task:
+                await evan_task
             await provider.close()
+            if evan_poller is not None:
+                await evan_poller.client.close()
 
     app = FastAPI(
         title="Team Energy History API",
@@ -188,6 +219,27 @@ def create_app(
             }
         return {"available": True, "raw_station": sample}
 
+    @app.get("/debug/evan-summary")
+    async def debug_evan_summary(
+        request: Request,
+        hours: Annotated[int, Query(ge=1, le=24 * 60)] = 24,
+    ) -> dict:
+        """On-demand usage summary from raw Evan polls, e.g. 'how many hours
+        was each connector charging in the last 24h'. Requires the shared
+        web credentials. Returns a note if Evan polling isn't configured.
+        """
+        store = getattr(request.app.state, "evan_store", None)
+        if store is None:
+            return {
+                "available": False,
+                "detail": (
+                    "Evan polling isn't configured (EVAN_PHONE/EVAN_PASSWORD "
+                    "not set)."
+                ),
+            }
+        summary = await asyncio.to_thread(store.summary_last_hours, hours)
+        return {"available": True, **summary}
+
     @app.get("/collector/gaps")
     async def collector_gaps(
         request: Request,
@@ -265,3 +317,5 @@ def create_app(
 
 
 app = create_app()
+
+        
