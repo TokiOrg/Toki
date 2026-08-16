@@ -134,16 +134,14 @@ class EvanClient:
         if self._tokens is not None and not self._tokens.access_expires_soon:
             return self._tokens.access_token
 
-        if self._tokens is not None:
-            # Have a (soon-to-expire) refresh token - use it.
-            self._tokens = await self._refresh(self._tokens.refresh_token)
-        elif self._pending_refresh_token:
-            # Resuming from a previously stored refresh token.
-            self._tokens = await self._refresh(self._pending_refresh_token)
-            self._pending_refresh_token = None
-        else:
-            self._tokens = await self._login_with_password()
-
+        # NOTE: the real /refresh endpoint path is unconfirmed (guessed path
+        # returns 404 - confirmed via captured logs). Rather than guess
+        # again, this simply re-logs in with phone+password whenever the
+        # access token is expiring. Evan's account, once its one-time OTP
+        # device-verification is done, only ever needs phone+password to
+        # sign in (confirmed: POST /api/users/auth/signin) - no OTP is
+        # required again, so this is safe to repeat unattended.
+        self._tokens = await self._login_with_password()
         return self._tokens.access_token
 
     @property
@@ -264,7 +262,3 @@ class EvanClient:
         if not isinstance(data, list):
             raise EvanError(f"Unexpected /charge-transactions shape: {payload}")
         return data
-
-
-   
-     
