@@ -54,9 +54,15 @@ class EvanStore:
                   plugType.type (e.g. "CCS2", "GB/T DC", "Type 1"),
                   plugType.powerType ("ac"/"dc"),
                   plugTypeVariant.power (rated kW),
-                  tariff.components: [{"type": "Charge", "price": ...}, ...]
+                  plugTypeVariant.voltage / .amperage,
+                  tariff.freeParkingMinutes,
+                  tariff.components: [{"type": "Charge"/"Parking"/
+                  "Reservation", "price": ...}, ...]
                   (Evan's real per-kWh price - observed 100 or 120 AMD,
-                  varying by station, unlike Team Energy's flat 120).
+                  varying by station, unlike Team Energy's flat 120. Parking
+                  and Reservation prices are a pricing dimension Team Energy
+                  never exposed at all - currently observed as 0 but the
+                  field is real and may vary).
         """
         connectors = []
         for station in stations:
@@ -67,6 +73,8 @@ class EvanStore:
             station_address_block = station.get("stationAddress") or {}
             address = station_address_block.get("address")
             city = station_address_block.get("city")
+            station_model = station.get("stationModel") or {}
+            station_type = station_model.get("type")  # "ac" / "dc"
             for plug in station.get("plugs") or []:
                 connector_id = str(plug.get("id") or "")
                 if not connector_id:
@@ -75,16 +83,23 @@ class EvanStore:
                 plug_variant = plug.get("plugTypeVariant") or {}
                 tariff = plug.get("tariff") or {}
                 price = None
+                parking_price = None
+                reservation_price = None
                 for component in tariff.get("components") or []:
-                    if component.get("type") == "Charge":
+                    component_type = component.get("type")
+                    if component_type == "Charge":
                         price = component.get("price")
-                        break
+                    elif component_type == "Parking":
+                        parking_price = component.get("price")
+                    elif component_type == "Reservation":
+                        reservation_price = component.get("price")
                 connectors.append(
                     {
                         "station_id": station_id,
                         "station_name": station_name,
                         "address": address,
                         "city": city,
+                        "station_type": station_type,
                         "connector_id": connector_id,
                         "connector_type": plug_type.get("type"),
                         "connector_type_group": (
@@ -92,9 +107,14 @@ class EvanStore:
                         ).upper()
                         or None,
                         "power_kw": plug_variant.get("power"),
+                        "voltage": plug_variant.get("voltage"),
+                        "amperage": plug_variant.get("amperage"),
                         "status": plug.get("status"),
                         "active_charge_percent": plug.get("activeChargePercent"),
                         "price": price,
+                        "free_parking_minutes": tariff.get("freeParkingMinutes"),
+                        "parking_price": parking_price,
+                        "reservation_price": reservation_price,
                     }
                 )
         if not connectors:
@@ -137,6 +157,10 @@ class EvanStore:
         status_counts: dict[str, int] = defaultdict(int)
         connector_charging_counts: dict[str, int] = defaultdict(int)
         connector_meta: dict[str, dict[str, Any]] = {}
+        # Battery: 0 means "no reading yet" (same pattern observed on Team
+        # Energy's stateOfBattery) rather than a real 0% charge level, so it
+        # is excluded from the readings collected here.
+        connector_battery_readings: dict[str, list[float]] = defaultdict(list)
 
         for polled_at, connectors in self._iter_polls_since(cutoff):
             poll_times.append(polled_at)
@@ -149,12 +173,23 @@ class EvanStore:
                     {
                         "station_name": connector.get("station_name"),
                         "address": connector.get("address"),
+                        "station_type": connector.get("station_type"),
                         "connector_type": connector.get("connector_type"),
                         "power_kw": connector.get("power_kw"),
+                        "voltage": connector.get("voltage"),
+                        "amperage": connector.get("amperage"),
+                        "price": connector.get("price"),
+                        "parking_price": connector.get("parking_price"),
+                        "free_parking_minutes": connector.get(
+                            "free_parking_minutes"
+                        ),
                     },
                 )
                 if "charg" in status:
                     connector_charging_counts[cid] += 1
+                    battery = connector.get("active_charge_percent")
+                    if battery is not None and battery > 0:
+                        connector_battery_readings[cid].append(float(battery))
 
         poll_times.sort()
         if len(poll_times) >= 2:
@@ -173,17 +208,45 @@ class EvanStore:
                 status_counts.items(), key=lambda item: -item[1]
             )
         ]
-        by_connector = [
-            {
+        by_connector = []
+        for cid, count in sorted(
+            connector_charging_counts.items(), key=lambda item: -item[1]
+        ):
+            readings = connector_battery_readings.get(cid) or []
+            entry = {
                 "connector_id": cid,
                 **connector_meta[cid],
                 "charging_polls": count,
                 "approx_charging_hours": round(count * gap_seconds / 3600, 2),
+                "battery_in_percent": round(readings[0], 1) if readings else None,
+                "battery_out_percent": round(readings[-1], 1) if readings else None,
+                "battery_readings_count": len(readings),
             }
-            for cid, count in sorted(
-                connector_charging_counts.items(), key=lambda item: -item[1]
-            )
-        ]
+            if len(readings) >= 2:
+                entry["battery_delta_percent"] = round(
+                    readings[-1] - readings[0], 1
+                )
+            else:
+                entry["battery_delta_percent"] = None
+            by_connector.append(entry)
+
+        all_ins = [c["battery_in_percent"] for c in by_connector if c["battery_in_percent"] is not None]
+        all_outs = [c["battery_out_percent"] for c in by_connector if c["battery_out_percent"] is not None]
+        all_deltas = [c["battery_delta_percent"] for c in by_connector if c["battery_delta_percent"] is not None]
+        battery_summary = {
+            "connectors_with_battery_data": sum(
+                1 for c in by_connector if c["battery_readings_count"] > 0
+            ),
+            "avg_battery_in_percent": round(sum(all_ins) / len(all_ins), 1) if all_ins else None,
+            "avg_battery_out_percent": round(sum(all_outs) / len(all_outs), 1) if all_outs else None,
+            "avg_battery_delta_percent": round(sum(all_deltas) / len(all_deltas), 1) if all_deltas else None,
+            "note": (
+                "0% readings are treated as 'no data yet' and excluded "
+                "(same pattern seen on Team Energy's stateOfBattery). "
+                "A connector needs at least 2 real readings during one "
+                "charging session for in/out/delta to populate."
+            ),
+        }
 
         return {
             "window_hours": hours,
@@ -191,4 +254,5 @@ class EvanStore:
             "poll_count": len(poll_times),
             "by_status": by_status,
             "by_connector": by_connector,
+            "battery": battery_summary,
         }
