@@ -96,12 +96,9 @@ class EvanClient:
                 "No refresh token available and no phone/password provided "
                 "to log in with."
             )
-        # NOTE: confirm this exact path against a captured traffic sample
-        # before relying on it - it was inferred from the auth/identity,
-        # auth/verification, auth/signup sequence and may need adjusting to
-        # match the real password-login endpoint your account uses.
+        # Confirmed via captured traffic: the real path is /signin, not /login.
         response = await self._client.post(
-            "/api/users/auth/login",
+            "/api/users/auth/signin",
             json={"phone": self._phone, "password": self._password},
         )
         return self._parse_token_response(response)
@@ -267,3 +264,7 @@ class EvanClient:
         if not isinstance(data, list):
             raise EvanError(f"Unexpected /charge-transactions shape: {payload}")
         return data
+
+
+   
+     
