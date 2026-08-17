@@ -240,6 +240,29 @@ def create_app(
         summary = await asyncio.to_thread(store.summary_last_hours, hours)
         return {"available": True, **summary}
 
+    @app.get("/debug/evan-sessions")
+    async def debug_evan_sessions(
+        request: Request,
+        hours: Annotated[int, Query(ge=1, le=24 * 60)] = 24,
+    ) -> dict:
+        """Real charging sessions reconstructed from the Evan poll log
+        (session start/end detected via status transitions, same idea as
+        Team Energy's interval tracking), giving an actual cars-served
+        count instead of an hours-based estimate. Requires the shared web
+        credentials.
+        """
+        store = getattr(request.app.state, "evan_store", None)
+        if store is None:
+            return {
+                "available": False,
+                "detail": (
+                    "Evan polling isn't configured (EVAN_PHONE/EVAN_PASSWORD "
+                    "not set)."
+                ),
+            }
+        sessions = await asyncio.to_thread(store.sessions_last_hours, hours)
+        return {"available": True, **sessions}
+
     @app.get("/collector/gaps")
     async def collector_gaps(
         request: Request,
@@ -317,5 +340,7 @@ def create_app(
 
 
 app = create_app()
+
+        
 
         
