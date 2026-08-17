@@ -47,6 +47,11 @@ class Settings:
         (39.84, 45.68),       # Jermuk
         (39.21, 46.41),       # Kapan
     )
+    # EcoCars needs no login at all - just an on/off switch. It fetches a
+    # nationwide bounding box in one call (no per-region tiling needed like
+    # Evan), so there's nothing else to configure.
+    ecocars_enabled: bool = False
+    ecocars_polls_path: Path = Path("data/ecocars_polls.jsonl")
 
     @classmethod
     def from_environment(cls) -> "Settings":
@@ -85,6 +90,11 @@ class Settings:
             evan_password=os.getenv("EVAN_PASSWORD", "").strip() or None,
             evan_polls_path=Path(
                 os.getenv("EVAN_POLLS_PATH", "data/evan_polls.jsonl")
+            ),
+            ecocars_enabled=os.getenv("ECOCARS_ENABLED", "").strip().lower()
+            in {"1", "true", "yes"},
+            ecocars_polls_path=Path(
+                os.getenv("ECOCARS_POLLS_PATH", "data/ecocars_polls.jsonl")
             ),
         )
         raw_grid = os.getenv("EVAN_GRID_CENTERS", "").strip()
