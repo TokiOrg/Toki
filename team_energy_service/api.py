@@ -19,6 +19,9 @@ from .database import Database
 from .evan_poller import EvanPoller
 from .evan_provider import EvanClient
 from .evan_store import EvanStore
+from .ecocars_poller import EcoCarsPoller
+from .ecocars_provider import EcoCarsClient
+from .ecocars_store import EcoCarsStore
 from .poller import Poller
 from .provider import TeamEnergyClient
 from .telegram import TelegramService
@@ -65,6 +68,19 @@ def create_app(
             grid_centers=settings.evan_grid_centers,
         )
 
+    ecocars_poller: EcoCarsPoller | None = None
+    ecocars_store: EcoCarsStore | None = None
+    if settings.ecocars_enabled:
+        ecocars_store = EcoCarsStore(settings.ecocars_polls_path)
+        ecocars_client = EcoCarsClient(
+            request_timeout_seconds=settings.request_timeout_seconds,
+        )
+        ecocars_poller = EcoCarsPoller(
+            client=ecocars_client,
+            store=ecocars_store,
+            interval_seconds=settings.poll_interval_seconds,
+        )
+
     @asynccontextmanager
     async def lifespan(app: FastAPI):
         await asyncio.to_thread(database.initialize)
@@ -72,6 +88,7 @@ def create_app(
         app.state.poller = poller
         app.state.telegram = telegram
         app.state.evan_store = evan_store
+        app.state.ecocars_store = ecocars_store
         polling_task = (
             asyncio.create_task(poller.run(), name="team-energy-poller")
             if start_poller
@@ -82,6 +99,13 @@ def create_app(
             await asyncio.to_thread(evan_store.initialize)
             if start_poller:
                 evan_task = asyncio.create_task(evan_poller.run(), name="evan-poller")
+        ecocars_task = None
+        if ecocars_poller is not None and ecocars_store is not None:
+            await asyncio.to_thread(ecocars_store.initialize)
+            if start_poller:
+                ecocars_task = asyncio.create_task(
+                    ecocars_poller.run(), name="ecocars-poller"
+                )
         telegram.start()
         try:
             yield
@@ -94,9 +118,15 @@ def create_app(
                 evan_poller.stop()
             if evan_task:
                 await evan_task
+            if ecocars_poller is not None:
+                ecocars_poller.stop()
+            if ecocars_task:
+                await ecocars_task
             await provider.close()
             if evan_poller is not None:
                 await evan_poller.client.close()
+            if ecocars_poller is not None:
+                await ecocars_poller.client.close()
 
     app = FastAPI(
         title="Team Energy History API",
@@ -259,6 +289,24 @@ def create_app(
                     "Evan polling isn't configured (EVAN_PHONE/EVAN_PASSWORD "
                     "not set)."
                 ),
+            }
+        sessions = await asyncio.to_thread(store.sessions_last_hours, hours)
+        return {"available": True, **sessions}
+
+    @app.get("/debug/ecocars-sessions")
+    async def debug_ecocars_sessions(
+        request: Request,
+        hours: Annotated[int, Query(ge=1, le=24 * 60)] = 24,
+    ) -> dict:
+        """Real charging sessions reconstructed from the EcoCars poll log,
+        same session-transition detection as Team Energy and Evan. Requires
+        the shared web credentials.
+        """
+        store = getattr(request.app.state, "ecocars_store", None)
+        if store is None:
+            return {
+                "available": False,
+                "detail": "EcoCars polling isn't configured (ECOCARS_ENABLED not set).",
             }
         sessions = await asyncio.to_thread(store.sessions_last_hours, hours)
         return {"available": True, **sessions}
