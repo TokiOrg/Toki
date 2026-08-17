@@ -256,3 +256,142 @@ class EvanStore:
             "by_connector": by_connector,
             "battery": battery_summary,
         }
+
+    def sessions_last_hours(self, hours: int = 24) -> dict[str, Any]:
+        """Reconstruct real charging sessions from the poll log.
+
+        Unlike summary_last_hours() (which just counts polls per status),
+        this walks each connector's polls in time order and detects actual
+        transitions into and out of "charging" - the same core idea as
+        Team Energy's connector_status_intervals, adapted to this simpler
+        flat poll-log format. A session here is bounded by consecutive
+        charging polls for one connector; a poll where that connector is
+        NOT charging (or is simply missing, e.g. a temporary API hiccup)
+        closes the session.
+
+        Session duration is estimated the same way Team Energy does: the
+        midpoint between the last non-charging poll and the first charging
+        poll, and between the last charging poll and the next non-charging
+        poll - splitting the "unknown" transition window rather than
+        pretending the exact start/end second is known.
+        """
+        cutoff = datetime.now(timezone.utc) - timedelta(hours=hours)
+
+        # Group poll rows by connector, in time order, keeping enough
+        # context (previous poll's time) to bound each session properly.
+        per_connector: dict[str, list[tuple[datetime, dict]]] = defaultdict(list)
+        all_polls_in_window: list[datetime] = []
+        for polled_at, connectors in self._iter_polls_since(cutoff):
+            all_polls_in_window.append(polled_at)
+            for connector in connectors:
+                per_connector[connector["connector_id"]].append((polled_at, connector))
+
+        all_polls_in_window.sort()
+        if len(all_polls_in_window) >= 2:
+            gap_seconds = (
+                all_polls_in_window[-1] - all_polls_in_window[0]
+            ).total_seconds() / (len(all_polls_in_window) - 1)
+        else:
+            gap_seconds = 30.0
+
+        sessions: list[dict[str, Any]] = []
+        for cid, rows in per_connector.items():
+            rows.sort(key=lambda r: r[0])
+            meta = rows[0][1]
+            in_session = False
+            session_start_poll: datetime | None = None
+            session_prev_poll: datetime | None = None
+            session_first_battery: float | None = None
+            session_last_battery: float | None = None
+            last_row_time: datetime | None = None
+
+            def close_session(end_boundary_poll: datetime | None):
+                if session_start_poll is None:
+                    return
+                # Midpoint estimate: start is between the poll before charging
+                # began and the first charging poll; end is between the last
+                # charging poll and the next poll after charging ended.
+                est_start = session_start_poll
+                if session_prev_poll is not None:
+                    est_start = session_prev_poll + (
+                        session_start_poll - session_prev_poll
+                    ) / 2
+                est_end = last_row_time
+                if end_boundary_poll is not None and last_row_time is not None:
+                    est_end = last_row_time + (
+                        end_boundary_poll - last_row_time
+                    ) / 2
+                duration_hours = 0.0
+                if est_end is not None and est_start is not None:
+                    duration_hours = max(
+                        0.0, (est_end - est_start).total_seconds() / 3600
+                    )
+                sessions.append(
+                    {
+                        "connector_id": cid,
+                        "station_name": meta.get("station_name"),
+                        "address": meta.get("address"),
+                        "connector_type": meta.get("connector_type"),
+                        "power_kw": meta.get("power_kw"),
+                        "estimated_start": est_start.isoformat() if est_start else None,
+                        "estimated_end": est_end.isoformat() if est_end else None,
+                        "duration_hours": round(duration_hours, 3),
+                        "battery_in_percent": session_first_battery,
+                        "battery_out_percent": session_last_battery,
+                    }
+                )
+
+            previous_poll_time: datetime | None = None
+            for poll_time, row in rows:
+                status = (row.get("status") or "").lower()
+                is_charging = "charg" in status
+                if is_charging and not in_session:
+                    in_session = True
+                    session_start_poll = poll_time
+                    session_prev_poll = previous_poll_time
+                    session_first_battery = None
+                    session_last_battery = None
+                if is_charging:
+                    battery = row.get("active_charge_percent")
+                    if battery is not None and battery > 0:
+                        if session_first_battery is None:
+                            session_first_battery = float(battery)
+                        session_last_battery = float(battery)
+                    last_row_time = poll_time
+                elif in_session:
+                    close_session(poll_time)
+                    in_session = False
+                    session_start_poll = None
+                previous_poll_time = poll_time
+
+            if in_session:
+                # Still charging as of the most recent poll in the window -
+                # close it at the last seen poll (session may continue).
+                close_session(None)
+
+        total_sessions = len(sessions)
+        total_hours = sum(s["duration_hours"] for s in sessions)
+
+        by_station: dict[tuple, dict[str, Any]] = {}
+        for s in sessions:
+            key = (s["station_name"], s["address"])
+            entry = by_station.setdefault(
+                key, {"station_name": s["station_name"], "address": s["address"], "cars_served": 0, "hours": 0.0}
+            )
+            entry["cars_served"] += 1
+            entry["hours"] += s["duration_hours"]
+        for entry in by_station.values():
+            entry["hours"] = round(entry["hours"], 2)
+
+        top_by_hours = sorted(by_station.values(), key=lambda e: -e["hours"])[:5]
+        top_by_cars = sorted(by_station.values(), key=lambda e: -e["cars_served"])[:5]
+
+        return {
+            "window_hours": hours,
+            "approx_poll_interval_seconds": round(gap_seconds, 1),
+            "total_sessions": total_sessions,
+            "total_charging_hours": round(total_hours, 2),
+            "top_stations_by_hours": top_by_hours,
+            "top_stations_by_cars": top_by_cars,
+            "sessions": sessions,
+        }
