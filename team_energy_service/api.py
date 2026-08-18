@@ -288,11 +288,15 @@ def create_app(
     async def debug_evan_sessions(
         request: Request,
         hours: Annotated[int, Query(ge=1, le=24 * 60)] = 24,
+        include_sessions: Annotated[bool, Query()] = False,
     ) -> dict:
         """Real charging sessions reconstructed from the Evan poll log
         (session start/end detected via status transitions, same idea as
         Team Energy's interval tracking), giving an actual cars-served
-        count instead of an hours-based estimate. Requires the shared web
+        count instead of an hours-based estimate. By default returns a
+        lean summary (totals, AC/DC split with kWh, revenue, battery,
+        top 3 stations) without the full per-session list - pass
+        include_sessions=true for the raw list. Requires the shared web
         credentials.
         """
         store = getattr(request.app.state, "evan_store", None)
@@ -304,17 +308,22 @@ def create_app(
                     "not set)."
                 ),
             }
-        sessions = await asyncio.to_thread(store.sessions_last_hours, hours)
+        sessions = await asyncio.to_thread(
+            store.sessions_last_hours, hours, include_sessions
+        )
         return {"available": True, **sessions}
 
     @app.get("/debug/ecocars-sessions")
     async def debug_ecocars_sessions(
         request: Request,
         hours: Annotated[int, Query(ge=1, le=24 * 60)] = 24,
+        include_sessions: Annotated[bool, Query()] = False,
     ) -> dict:
         """Real charging sessions reconstructed from the EcoCars poll log,
-        same session-transition detection as Team Energy and Evan. Requires
-        the shared web credentials.
+        same session-transition detection as Team Energy and Evan. By
+        default returns a lean summary without the full per-session list -
+        pass include_sessions=true for the raw list. Requires the shared
+        web credentials.
         """
         store = getattr(request.app.state, "ecocars_store", None)
         if store is None:
@@ -322,7 +331,9 @@ def create_app(
                 "available": False,
                 "detail": "EcoCars polling isn't configured (ECOCARS_ENABLED not set).",
             }
-        sessions = await asyncio.to_thread(store.sessions_last_hours, hours)
+        sessions = await asyncio.to_thread(
+            store.sessions_last_hours, hours, include_sessions
+        )
         return {"available": True, **sessions}
 
     @app.get("/collector/gaps")
