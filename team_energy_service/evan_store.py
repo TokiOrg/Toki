@@ -333,6 +333,7 @@ class EvanStore:
                         "address": meta.get("address"),
                         "connector_type": meta.get("connector_type"),
                         "power_kw": meta.get("power_kw"),
+                        "price": meta.get("price"),
                         "estimated_start": est_start.isoformat() if est_start else None,
                         "estimated_end": est_end.isoformat() if est_end else None,
                         "duration_hours": round(duration_hours, 3),
@@ -386,11 +387,23 @@ class EvanStore:
         top_by_hours = sorted(by_station.values(), key=lambda e: -e["hours"])[:5]
         top_by_cars = sorted(by_station.values(), key=lambda e: -e["cars_served"])[:5]
 
+        # Scenario revenue: duration x rated power x load factor x Evan's real
+        # per-connector price (same approach used for Team Energy). Two load
+        # factors are reported: the model default (0.5) and the factor
+        # measured from a real test charge (0.29) - see conversation history.
+        revenue_default = sum(
+            s["duration_hours"] * (s.get("power_kw") or 0) * 0.5 * (s.get("price") or 0)
+            for s in sessions
+        )
+        revenue_calibrated = revenue_default * (0.29 / 0.5)
+
         return {
             "window_hours": hours,
             "approx_poll_interval_seconds": round(gap_seconds, 1),
             "total_sessions": total_sessions,
             "total_charging_hours": round(total_hours, 2),
+            "scenario_revenue_amd_default_load_factor": round(revenue_default),
+            "scenario_revenue_amd_calibrated_load_factor": round(revenue_calibrated),
             "top_stations_by_hours": top_by_hours,
             "top_stations_by_cars": top_by_cars,
             "sessions": sessions,
