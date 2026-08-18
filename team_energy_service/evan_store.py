@@ -257,7 +257,9 @@ class EvanStore:
             "battery": battery_summary,
         }
 
-    def sessions_last_hours(self, hours: int = 24) -> dict[str, Any]:
+    def sessions_last_hours(
+        self, hours: int = 24, include_sessions: bool = False
+    ) -> dict[str, Any]:
         """Reconstruct real charging sessions from the poll log.
 
         Unlike summary_last_hours() (which just counts polls per status),
@@ -274,6 +276,12 @@ class EvanStore:
         poll, and between the last charging poll and the next non-charging
         poll - splitting the "unknown" transition window rather than
         pretending the exact start/end second is known.
+
+        By default (include_sessions=False) the raw per-session list is
+        omitted from the return - a network with many charging events can
+        produce hundreds of session records, which is far more than needed
+        for a routine check. Pass include_sessions=True to get the full
+        list back (e.g. for building a detailed report).
         """
         cutoff = datetime.now(timezone.utc) - timedelta(hours=hours)
 
@@ -384,8 +392,8 @@ class EvanStore:
         for entry in by_station.values():
             entry["hours"] = round(entry["hours"], 2)
 
-        top_by_hours = sorted(by_station.values(), key=lambda e: -e["hours"])[:5]
-        top_by_cars = sorted(by_station.values(), key=lambda e: -e["cars_served"])[:5]
+        top_by_hours = sorted(by_station.values(), key=lambda e: -e["hours"])[:3]
+        top_by_cars = sorted(by_station.values(), key=lambda e: -e["cars_served"])[:3]
 
         # Scenario revenue: duration x rated power x load factor x Evan's real
         # per-connector price (same approach used for Team Energy). Two load
@@ -397,15 +405,59 @@ class EvanStore:
         )
         revenue_calibrated = revenue_default * (0.29 / 0.5)
 
+        # AC/DC split by rated power (>=50kW counted as DC/fast-charging,
+        # matching the corrected classification used elsewhere - the raw
+        # station_type/connector_type_group label is unreliable at mixed
+        # AC+DC stations).
+        ac_hours = sum(s["duration_hours"] for s in sessions if (s.get("power_kw") or 0) < 50)
+        dc_hours = sum(s["duration_hours"] for s in sessions if (s.get("power_kw") or 0) >= 50)
+        ac_cars = sum(1 for s in sessions if (s.get("power_kw") or 0) < 50)
+        dc_cars = sum(1 for s in sessions if (s.get("power_kw") or 0) >= 50)
+        ac_kwh_ceiling = sum(
+            s["duration_hours"] * (s.get("power_kw") or 0)
+            for s in sessions if (s.get("power_kw") or 0) < 50
+        )
+        dc_kwh_ceiling = sum(
+            s["duration_hours"] * (s.get("power_kw") or 0)
+            for s in sessions if (s.get("power_kw") or 0) >= 50
+        )
+
+        battery_in = [s["battery_in_percent"] for s in sessions if s.get("battery_in_percent") is not None]
+        battery_out = [s["battery_out_percent"] for s in sessions if s.get("battery_out_percent") is not None]
+        battery_delta = [
+            s["battery_out_percent"] - s["battery_in_percent"]
+            for s in sessions
+            if s.get("battery_in_percent") is not None and s.get("battery_out_percent") is not None
+        ]
+
+        def battery_stats(values: list[float]) -> dict[str, Any]:
+            if not values:
+                return {"average_percent": None, "sample_size": 0}
+            return {
+                "average_percent": round(sum(values) / len(values), 1),
+                "sample_size": len(values),
+            }
+
         return {
             "window_hours": hours,
             "approx_poll_interval_seconds": round(gap_seconds, 1),
             "total_sessions": total_sessions,
             "total_charging_hours": round(total_hours, 2),
+            "ac_charging_hours": round(ac_hours, 2),
+            "ac_cars_served": ac_cars,
+            "ac_rated_energy_ceiling_kwh": round(ac_kwh_ceiling, 1),
+            "dc_charging_hours": round(dc_hours, 2),
+            "dc_cars_served": dc_cars,
+            "dc_rated_energy_ceiling_kwh": round(dc_kwh_ceiling, 1),
+            "avg_session_minutes": round(total_hours / total_sessions * 60, 1)
+            if total_sessions
+            else None,
             "scenario_revenue_amd_default_load_factor": round(revenue_default),
             "scenario_revenue_amd_calibrated_load_factor": round(revenue_calibrated),
+            "battery_in": battery_stats(battery_in),
+            "battery_out": battery_stats(battery_out),
+            "battery_delta": battery_stats(battery_delta),
             "top_stations_by_hours": top_by_hours,
             "top_stations_by_cars": top_by_cars,
-            "sessions": sessions,
+            "sessions": sessions if include_sessions else None,
         }
-   
