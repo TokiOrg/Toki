@@ -668,6 +668,217 @@ class Database:
                 [cutoff_at],
             )
 
+    def recent_summary(
+        self,
+        hours: int = 24,
+        load_factors: tuple[float, ...] = (0.5, 0.3),
+        day_price: float = 120.0,
+        night_price: float = 100.0,
+        night_start_hour: int = 1,
+        night_end_hour: int = 8,
+        local_timezone: str = "Asia/Yerevan",
+    ) -> dict[str, Any]:
+        """Lean, time-scoped summary for the last N hours only.
+
+        Unlike analytics_payload() (which builds the full workbook dataset -
+        every table, full history), this only pulls connector intervals that
+        overlap the requested window directly via SQL, then computes
+        sessions/hours/revenue/battery in Python using the same day/night
+        and midpoint-estimate logic as the rest of the system. Meant for a
+        lightweight debug endpoint so a daily check doesn't require pulling
+        the full /excel export.
+        """
+        cutoff_at = datetime.now(timezone.utc) - timedelta(hours=hours)
+        now = datetime.now(timezone.utc)
+        with self._lock, self._connect() as connection:
+            rows = _rows_as_dicts(
+                connection,
+                """
+                SELECT
+                    history.connector_id,
+                    history.station_id,
+                    history.status,
+                    history.power_kw,
+                    history.started_at,
+                    history.ended_at,
+                    history.battery_at_start,
+                    history.battery_at_end,
+                    connectors.connector_type_group,
+                    stations.name AS station_name,
+                    stations.address AS station_address
+                FROM connector_status_intervals AS history
+                LEFT JOIN connectors
+                    ON connectors.connector_id = history.connector_id
+                LEFT JOIN stations
+                    ON stations.station_id = history.station_id
+                WHERE history.status = 'charging'
+                  AND coalesce(history.ended_at, ?) >= ?
+                """,
+                [now, cutoff_at],
+            )
+
+        try:
+            from zoneinfo import ZoneInfo
+
+            tz = ZoneInfo(local_timezone)
+        except Exception:  # pragma: no cover - fallback if tzdata missing
+            tz = timezone.utc
+
+        def price_at(dt: datetime) -> float:
+            local_hour = dt.astimezone(tz).hour
+            return (
+                night_price
+                if night_start_hour <= local_hour < night_end_hour
+                else day_price
+            )
+
+        def price_segments(start, end):
+            if start is None or end is None or end <= start:
+                return
+            boundaries = []
+            day_cursor = start.astimezone(tz).replace(
+                hour=0, minute=0, second=0, microsecond=0
+            )
+            last_day = end.astimezone(tz).replace(
+                hour=0, minute=0, second=0, microsecond=0
+            ) + timedelta(days=1)
+            while day_cursor <= last_day:
+                for hour in (night_start_hour, night_end_hour):
+                    boundary = day_cursor.replace(hour=hour).astimezone(
+                        timezone.utc
+                    )
+                    if start < boundary < end:
+                        boundaries.append(boundary)
+                day_cursor += timedelta(days=1)
+            points = [start] + sorted(boundaries) + [end]
+            for i in range(len(points) - 1):
+                a, b = points[i], points[i + 1]
+                if b > a:
+                    yield a, b, price_at(a + (b - a) / 2)
+
+        def clip_hours(start, end, window_start, window_end) -> float:
+            if start is None:
+                return 0.0
+            if end is None:
+                end = window_end
+            s = max(start, window_start)
+            e = min(end, window_end)
+            return max(0.0, (e - s).total_seconds() / 3600) if e > s else 0.0
+
+        window_start, window_end = cutoff_at, now
+        sessions = 0
+        total_hours = 0.0
+        ac_hours = ac_kwh_ceiling = 0.0
+        dc_hours = dc_kwh_ceiling = 0.0
+        revenue = {factor: 0.0 for factor in load_factors}
+        battery_in: list[float] = []
+        battery_out: list[float] = []
+        battery_delta: list[float] = []
+        per_station: dict[str, dict[str, Any]] = {}
+
+        for row in rows:
+            start = row["started_at"]
+            end = row["ended_at"]
+            power = float(row.get("power_kw") or 0)
+            hours_in_window = clip_hours(start, end, window_start, window_end)
+            station_id = row.get("station_id")
+            station_entry = per_station.setdefault(
+                station_id,
+                {
+                    "station_name": row.get("station_name"),
+                    "address": row.get("station_address"),
+                    "hours": 0.0,
+                    "cars_served": 0,
+                },
+            )
+            if hours_in_window > 0:
+                total_hours += hours_in_window
+                station_entry["hours"] += hours_in_window
+                group = (row.get("connector_type_group") or "").upper()
+                ceiling_kwh = hours_in_window * power
+                if group == "AC":
+                    ac_hours += hours_in_window
+                    ac_kwh_ceiling += ceiling_kwh
+                elif group == "DC":
+                    dc_hours += hours_in_window
+                    dc_kwh_ceiling += ceiling_kwh
+                for seg_start, seg_end, price in price_segments(start, end):
+                    seg_hours = clip_hours(
+                        seg_start, seg_end, window_start, window_end
+                    )
+                    if seg_hours <= 0:
+                        continue
+                    for factor in load_factors:
+                        revenue[factor] += seg_hours * power * factor * price
+
+            if start is not None and window_start <= start < window_end:
+                sessions += 1
+                station_entry["cars_served"] += 1
+                battery_start = row.get("battery_at_start")
+                battery_end = row.get("battery_at_end")
+                if battery_start is not None and battery_start > 0:
+                    battery_in.append(float(battery_start))
+                if battery_end is not None and battery_end > 0:
+                    battery_out.append(float(battery_end))
+                if (
+                    battery_start is not None
+                    and battery_start > 0
+                    and battery_end is not None
+                    and battery_end > 0
+                ):
+                    battery_delta.append(float(battery_end) - float(battery_start))
+
+        top_by_hours = sorted(
+            (
+                {"station_id": sid, **entry}
+                for sid, entry in per_station.items()
+                if entry["hours"] > 0
+            ),
+            key=lambda e: -e["hours"],
+        )[:3]
+        top_by_cars = sorted(
+            (
+                {"station_id": sid, **entry}
+                for sid, entry in per_station.items()
+                if entry["cars_served"] > 0
+            ),
+            key=lambda e: -e["cars_served"],
+        )[:3]
+
+        def battery_stats(values: list[float]) -> dict[str, Any]:
+            if not values:
+                return {"average_percent": None, "sample_size": 0}
+            return {
+                "average_percent": round(sum(values) / len(values), 1),
+                "sample_size": len(values),
+            }
+
+        return {
+            "window_hours": hours,
+            "window_start": window_start.isoformat(),
+            "window_end": window_end.isoformat(),
+            "cars_served": sessions,
+            "total_charging_hours": round(total_hours, 2),
+            "ac_charging_hours": round(ac_hours, 2),
+            "ac_rated_energy_ceiling_kwh": round(ac_kwh_ceiling, 1),
+            "dc_charging_hours": round(dc_hours, 2),
+            "dc_rated_energy_ceiling_kwh": round(dc_kwh_ceiling, 1),
+            "avg_session_minutes": round(total_hours / sessions * 60, 1)
+            if sessions
+            else None,
+            "scenario_revenue_amd": {
+                f"load_factor_{factor}": round(amount)
+                for factor, amount in revenue.items()
+            },
+            "battery_in": battery_stats(battery_in),
+            "battery_out": battery_stats(battery_out),
+            "battery_delta": battery_stats(battery_delta),
+            "top_stations_by_hours": [
+                {**e, "hours": round(e["hours"], 2)} for e in top_by_hours
+            ],
+            "top_stations_by_cars": top_by_cars,
+        }
+
     def summary(self) -> dict[str, Any]:
         with self._lock, self._connect() as connection:
             station_rows = connection.execute(
