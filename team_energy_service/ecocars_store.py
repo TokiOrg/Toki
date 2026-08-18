@@ -107,7 +107,9 @@ class EcoCarsStore:
                 if polled_at >= cutoff:
                     yield polled_at, record["connectors"]
 
-    def sessions_last_hours(self, hours: int = 24) -> dict[str, Any]:
+    def sessions_last_hours(
+        self, hours: int = 24, include_sessions: bool = False
+    ) -> dict[str, Any]:
         """Reconstruct real charging sessions from the poll log.
 
         Same transition-detection approach validated on evan_store.py:
@@ -270,5 +272,5 @@ class EcoCarsStore:
             "avg_battery_delta_percent": round(sum(battery_deltas) / len(battery_deltas), 1) if battery_deltas else None,
             "top_stations_by_hours": top_by_hours,
             "top_stations_by_cars": top_by_cars,
-            "sessions": sessions,
+            "sessions": sessions if include_sessions else None,
         }
