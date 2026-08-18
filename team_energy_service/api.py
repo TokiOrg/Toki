@@ -220,6 +220,20 @@ def create_app(
     async def summary(request: Request) -> dict:
         return await asyncio.to_thread(request.app.state.database.summary)
 
+    @app.get("/debug/recent-summary")
+    async def debug_recent_summary(
+        request: Request,
+        hours: Annotated[int, Query(ge=1, le=24 * 60)] = 24,
+    ) -> dict:
+        """Lightweight, time-scoped Team Energy summary (cars served, hours,
+        AC/DC split with kWh ceilings, revenue at 0.5 and 0.3 load factors,
+        battery in/out/delta, top 3 stations by hours and by cars). Meant as
+        a cheap daily check that doesn't require pulling the full /excel
+        export. Requires the shared web credentials.
+        """
+        database = request.app.state.database
+        return await asyncio.to_thread(database.recent_summary, hours)
+
     @app.get("/analytics/map")
     async def map_analytics(
         request: Request,
@@ -388,6 +402,8 @@ def create_app(
 
 
 app = create_app()
+
+        
 
         
 
