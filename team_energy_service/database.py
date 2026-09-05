@@ -688,8 +688,96 @@ class Database:
         lightweight debug endpoint so a daily check doesn't require pulling
         the full /excel export.
         """
-        cutoff_at = datetime.now(timezone.utc) - timedelta(hours=hours)
         now = datetime.now(timezone.utc)
+        cutoff_at = now - timedelta(hours=hours)
+        result = self._summary_for_window(
+            cutoff_at,
+            now,
+            load_factors=load_factors,
+            day_price=day_price,
+            night_price=night_price,
+            night_start_hour=night_start_hour,
+            night_end_hour=night_end_hour,
+            local_timezone=local_timezone,
+        )
+        return {"window_hours": hours, **result}
+
+    def daily_summary(
+        self,
+        start_date: str,
+        end_date: str,
+        load_factors: tuple[float, ...] = (0.5, 0.3),
+        day_price: float = 120.0,
+        night_price: float = 100.0,
+        night_start_hour: int = 1,
+        night_end_hour: int = 8,
+        local_timezone: str = "Asia/Yerevan",
+    ) -> dict[str, Any]:
+        """Same metrics as recent_summary(), but returned as one block per
+        calendar day between start_date and end_date (inclusive), in the
+        service's local timezone rather than one flat total for the whole
+        range.
+
+        start_date / end_date are "YYYY-MM-DD" strings, interpreted as
+        calendar days in `local_timezone`. Works on any historical range
+        already present in connector_status_intervals - this only re-reads
+        and re-buckets existing data, it does not require the range to be
+        "from now on".
+        """
+        try:
+            from zoneinfo import ZoneInfo
+
+            tz = ZoneInfo(local_timezone)
+        except Exception:  # pragma: no cover - fallback if tzdata missing
+            tz = timezone.utc
+
+        start = datetime.strptime(start_date, "%Y-%m-%d").replace(tzinfo=tz)
+        end = datetime.strptime(end_date, "%Y-%m-%d").replace(tzinfo=tz)
+        if end < start:
+            raise ValueError("end_date must not be before start_date")
+
+        days: list[dict[str, Any]] = []
+        cursor = start
+        while cursor <= end:
+            day_start = cursor
+            day_end = cursor + timedelta(days=1)
+            result = self._summary_for_window(
+                day_start.astimezone(timezone.utc),
+                day_end.astimezone(timezone.utc),
+                load_factors=load_factors,
+                day_price=day_price,
+                night_price=night_price,
+                night_start_hour=night_start_hour,
+                night_end_hour=night_end_hour,
+                local_timezone=local_timezone,
+            )
+            days.append({"date": cursor.strftime("%Y-%m-%d"), **result})
+            cursor += timedelta(days=1)
+
+        return {
+            "start_date": start_date,
+            "end_date": end_date,
+            "days": days,
+        }
+
+    def _summary_for_window(
+        self,
+        window_start: datetime,
+        window_end: datetime,
+        load_factors: tuple[float, ...],
+        day_price: float,
+        night_price: float,
+        night_start_hour: int,
+        night_end_hour: int,
+        local_timezone: str,
+    ) -> dict[str, Any]:
+        """Core computation shared by recent_summary() and daily_summary().
+
+        Pulls only connector intervals overlapping [window_start, window_end)
+        directly via SQL, then computes sessions/hours/revenue/battery in
+        Python using the same day/night and midpoint-estimate logic used
+        throughout the rest of the system.
+        """
         with self._lock, self._connect() as connection:
             rows = _rows_as_dicts(
                 connection,
@@ -713,8 +801,9 @@ class Database:
                     ON stations.station_id = history.station_id
                 WHERE history.status = 'charging'
                   AND coalesce(history.ended_at, ?) >= ?
+                  AND history.started_at < ?
                 """,
-                [now, cutoff_at],
+                [window_end, window_start, window_end],
             )
 
         try:
@@ -756,16 +845,15 @@ class Database:
                 if b > a:
                     yield a, b, price_at(a + (b - a) / 2)
 
-        def clip_hours(start, end, window_start, window_end) -> float:
+        def clip_hours(start, end, w_start, w_end) -> float:
             if start is None:
                 return 0.0
             if end is None:
-                end = window_end
-            s = max(start, window_start)
-            e = min(end, window_end)
+                end = w_end
+            s = max(start, w_start)
+            e = min(end, w_end)
             return max(0.0, (e - s).total_seconds() / 3600) if e > s else 0.0
 
-        window_start, window_end = cutoff_at, now
         sessions = 0
         total_hours = 0.0
         ac_hours = ac_kwh_ceiling = 0.0
@@ -854,7 +942,6 @@ class Database:
             }
 
         return {
-            "window_hours": hours,
             "window_start": window_start.isoformat(),
             "window_end": window_end.isoformat(),
             "cars_served": sessions,
