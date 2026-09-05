@@ -9,6 +9,7 @@ estimate. This is the lesson learned from the Evan integration.
 from __future__ import annotations
 
 import json
+import os
 import threading
 from collections import defaultdict
 from datetime import datetime, timedelta, timezone
@@ -272,6 +273,102 @@ class EcoCarsStore:
             with self._lock:
                 with self.rollup_path.open("a", encoding="utf-8") as handle:
                     handle.write("\n".join(new_lines) + "\n")
+
+    def rollup_and_prune(
+        self, retain_days: int = 3, local_timezone: str = "Asia/Yerevan"
+    ) -> dict[str, Any]:
+        """Roll up any not-yet-cached completed day, then shrink the raw
+        poll log to only the last `retain_days` days. Same memory-safe
+        streaming approach as evan_store.py's rollup_and_prune() - never
+        loads the whole file into memory, buffers at most one calendar
+        day's worth of polls at a time. See that method's docstring for
+        the full rationale (the raw log growing to gigabytes in size was
+        too slow, and risky memory-wise, to read even once per request).
+        """
+        try:
+            from zoneinfo import ZoneInfo
+
+            tz = ZoneInfo(local_timezone)
+        except Exception:  # pragma: no cover - fallback if tzdata missing
+            tz = timezone.utc
+
+        if not self.path.exists():
+            return {"days_rolled_up": 0, "lines_kept": 0, "lines_pruned": 0}
+
+        today_local = datetime.now(tz).date()
+        cutoff_date = today_local - timedelta(days=retain_days)
+        already_cached = set(self._load_rollups().keys())
+
+        tmp_path = self.path.with_suffix(".tmp")
+        days_rolled_up = 0
+        lines_kept = 0
+        lines_pruned = 0
+        new_rollup_lines: list[str] = []
+
+        current_day_key = None
+        current_day_buffer: list[tuple[datetime, list[dict]]] = []
+
+        def finalize_day(day_key, buffer: list[tuple[datetime, list[dict]]]) -> None:
+            nonlocal days_rolled_up
+            if day_key is None or not buffer:
+                return
+            if day_key >= today_local:
+                return
+            date_str = day_key.strftime("%Y-%m-%d")
+            if date_str in already_cached:
+                return
+            day_start = datetime.combine(
+                day_key, datetime.min.time(), tzinfo=tz
+            ).astimezone(timezone.utc)
+            day_end = day_start + timedelta(days=1)
+            result = self._sessions_from_polls(
+                buffer, day_start, day_end, include_sessions=False
+            )
+            new_rollup_lines.append(
+                json.dumps({"date": date_str, **result}, ensure_ascii=False)
+            )
+            already_cached.add(date_str)
+            days_rolled_up += 1
+
+        with self._lock:
+            with self.path.open("r", encoding="utf-8") as src, tmp_path.open(
+                "w", encoding="utf-8"
+            ) as dst:
+                for raw_line in src:
+                    stripped = raw_line.strip()
+                    if not stripped:
+                        continue
+                    try:
+                        record = json.loads(stripped)
+                        polled_at = datetime.fromisoformat(record["polled_at"])
+                    except (json.JSONDecodeError, KeyError, ValueError):
+                        continue
+                    day_key = polled_at.astimezone(tz).date()
+                    if day_key != current_day_key:
+                        finalize_day(current_day_key, current_day_buffer)
+                        current_day_key = day_key
+                        current_day_buffer = []
+                    current_day_buffer.append((polled_at, record["connectors"]))
+
+                    if day_key >= cutoff_date:
+                        dst.write(raw_line if raw_line.endswith("\n") else raw_line + "\n")
+                        lines_kept += 1
+                    else:
+                        lines_pruned += 1
+
+                finalize_day(current_day_key, current_day_buffer)
+
+            if new_rollup_lines:
+                with self.rollup_path.open("a", encoding="utf-8") as handle:
+                    handle.write("\n".join(new_rollup_lines) + "\n")
+
+            os.replace(tmp_path, self.path)
+
+        return {
+            "days_rolled_up": days_rolled_up,
+            "lines_kept": lines_kept,
+            "lines_pruned": lines_pruned,
+        }
 
     def _sessions_for_window(
         self, window_start: datetime, window_end: datetime, include_sessions: bool
