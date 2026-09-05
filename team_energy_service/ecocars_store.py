@@ -1,9 +1,19 @@
-"""Storage for EcoCars network snapshots, with real session tracking.
+"""Minimal standalone storage for Evan network snapshots.
 
-Same append-only JSON-lines design as evan_store.py, but with proper
-session-interval detection built in from the start (walking the poll log in
-time order and detecting status transitions), rather than a poll-count
-estimate. This is the lesson learned from the Evan integration.
+Deliberately simple and separate from team_energy_service/database.py: no
+new database engine, just one append-only JSON-lines file. Every poll writes
+one line containing every connector's status at that moment. That's enough
+to compute "how many hours was X charging in the last 24h" style summaries
+on demand, without any of the interval-compression machinery the Team Energy
+side uses.
+
+File format: one JSON object per line, e.g.
+    {"polled_at": "2026-08-16T10:00:00+00:00", "connectors": [
+        {"station_id": "...", "station_name": "...", "address": "...",
+         "connector_id": "...", "connector_type": "...", "power_kw": 22,
+         "status": "charging"},
+        ...
+    ]}
 """
 
 from __future__ import annotations
@@ -15,11 +25,9 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
-from .ecocars_provider import CONNECTOR_TYPE_NAMES, STATUS_NAMES
 
-
-class EcoCarsStore:
-    """Append-only JSON-lines store for raw EcoCars connector polls."""
+class EvanStore:
+    """Append-only JSON-lines store for raw Evan connector polls."""
 
     def __init__(self, path: Path) -> None:
         self.path = path
@@ -33,12 +41,28 @@ class EcoCarsStore:
     def record_snapshot(self, stations: list[dict[str, Any]], polled_at: datetime) -> int:
         """Append one line with every connector's status from this poll.
 
-        Field mapping per the documented EcoCars response shape:
-            station: id, name, address, geo.lat/lon, online, isInUse
-            connector: id, type (int enum), status (int enum), maxOutputKw,
-                       chargePercentage (string, "0" = no reading, same
-                       0-means-unknown pattern seen on Team Energy and Evan),
-                       rates.energy.price, rates.parking.price
+        `stations` is the raw `data.stations` list from Evan's
+        /api/stations/stations response. Confirmed real shape (from a
+        captured sample):
+            station: id, name, status, latitude, longitude,
+                     stationModel.type ("ac"/"dc"),
+                     stationAddress.address / .city
+                     plugs: [ ... ]
+            plug: id, connectorId, status ("Available"/"Charging"/"Faulted"),
+                  activeChargePercent (0/null - same "0 = no reading yet"
+                  pattern as Team Energy's stateOfBattery),
+                  plugType.type (e.g. "CCS2", "GB/T DC", "Type 1"),
+                  plugType.powerType ("ac"/"dc"),
+                  plugTypeVariant.power (rated kW),
+                  plugTypeVariant.voltage / .amperage,
+                  tariff.freeParkingMinutes,
+                  tariff.components: [{"type": "Charge"/"Parking"/
+                  "Reservation", "price": ...}, ...]
+                  (Evan's real per-kWh price - observed 100 or 120 AMD,
+                  varying by station, unlike Team Energy's flat 120. Parking
+                  and Reservation prices are a pricing dimension Team Energy
+                  never exposed at all - currently observed as 0 but the
+                  field is real and may vary).
         """
         connectors = []
         for station in stations:
@@ -46,38 +70,51 @@ class EcoCarsStore:
             if not station_id:
                 continue
             station_name = station.get("name")
-            address = station.get("address")
-            geo = station.get("geo") or {}
-            for connector in station.get("connectors") or []:
-                connector_id = f"{station_id}:{connector.get('id')}"
-                if connector.get("id") is None:
+            station_address_block = station.get("stationAddress") or {}
+            address = station_address_block.get("address")
+            city = station_address_block.get("city")
+            station_model = station.get("stationModel") or {}
+            station_type = station_model.get("type")  # "ac" / "dc"
+            for plug in station.get("plugs") or []:
+                connector_id = str(plug.get("id") or "")
+                if not connector_id:
                     continue
-                type_id = connector.get("type")
-                status_id = connector.get("status")
-                rates = connector.get("rates") or {}
-                energy_rate = rates.get("energy") or {}
-                parking_rate = rates.get("parking") or {}
-                battery_raw = connector.get("chargePercentage")
-                try:
-                    battery = float(battery_raw) if battery_raw is not None else None
-                except (TypeError, ValueError):
-                    battery = None
+                plug_type = plug.get("plugType") or {}
+                plug_variant = plug.get("plugTypeVariant") or {}
+                tariff = plug.get("tariff") or {}
+                price = None
+                parking_price = None
+                reservation_price = None
+                for component in tariff.get("components") or []:
+                    component_type = component.get("type")
+                    if component_type == "Charge":
+                        price = component.get("price")
+                    elif component_type == "Parking":
+                        parking_price = component.get("price")
+                    elif component_type == "Reservation":
+                        reservation_price = component.get("price")
                 connectors.append(
                     {
                         "station_id": station_id,
                         "station_name": station_name,
                         "address": address,
-                        "latitude": geo.get("lat"),
-                        "longitude": geo.get("lon"),
+                        "city": city,
+                        "station_type": station_type,
                         "connector_id": connector_id,
-                        "connector_type": CONNECTOR_TYPE_NAMES.get(
-                            type_id, f"type_{type_id}"
-                        ),
-                        "power_kw": connector.get("maxOutputKw"),
-                        "status": STATUS_NAMES.get(status_id, f"status_{status_id}"),
-                        "active_charge_percent": battery,
-                        "price": energy_rate.get("price"),
-                        "parking_price_per_min": parking_rate.get("price"),
+                        "connector_type": plug_type.get("type"),
+                        "connector_type_group": (
+                            plug_type.get("powerType") or ""
+                        ).upper()
+                        or None,
+                        "power_kw": plug_variant.get("power"),
+                        "voltage": plug_variant.get("voltage"),
+                        "amperage": plug_variant.get("amperage"),
+                        "status": plug.get("status"),
+                        "active_charge_percent": plug.get("activeChargePercent"),
+                        "price": price,
+                        "free_parking_minutes": tariff.get("freeParkingMinutes"),
+                        "parking_price": parking_price,
+                        "reservation_price": reservation_price,
                     }
                 )
         if not connectors:
@@ -107,11 +144,130 @@ class EcoCarsStore:
                 if polled_at >= cutoff and (until is None or polled_at < until):
                     yield polled_at, record["connectors"]
 
+    def summary_last_hours(self, hours: int = 24) -> dict[str, Any]:
+        """Rough usage summary from raw polls over the last N hours.
+
+        Poll-count based: each poll represents roughly one polling interval
+        of time in whatever status it shows. Good enough for "how many
+        hours was X charging" without interval-compression engineering.
+        """
+        cutoff = datetime.now(timezone.utc) - timedelta(hours=hours)
+
+        poll_times: list[datetime] = []
+        status_counts: dict[str, int] = defaultdict(int)
+        connector_charging_counts: dict[str, int] = defaultdict(int)
+        connector_meta: dict[str, dict[str, Any]] = {}
+        # Battery: 0 means "no reading yet" (same pattern observed on Team
+        # Energy's stateOfBattery) rather than a real 0% charge level, so it
+        # is excluded from the readings collected here.
+        connector_battery_readings: dict[str, list[float]] = defaultdict(list)
+
+        for polled_at, connectors in self._iter_polls_since(cutoff):
+            poll_times.append(polled_at)
+            for connector in connectors:
+                status = (connector.get("status") or "unknown").lower()
+                status_counts[status] += 1
+                cid = connector["connector_id"]
+                connector_meta.setdefault(
+                    cid,
+                    {
+                        "station_name": connector.get("station_name"),
+                        "address": connector.get("address"),
+                        "station_type": connector.get("station_type"),
+                        "connector_type": connector.get("connector_type"),
+                        "power_kw": connector.get("power_kw"),
+                        "voltage": connector.get("voltage"),
+                        "amperage": connector.get("amperage"),
+                        "price": connector.get("price"),
+                        "parking_price": connector.get("parking_price"),
+                        "free_parking_minutes": connector.get(
+                            "free_parking_minutes"
+                        ),
+                    },
+                )
+                if "charg" in status:
+                    connector_charging_counts[cid] += 1
+                    battery = connector.get("active_charge_percent")
+                    if battery is not None and battery > 0:
+                        connector_battery_readings[cid].append(float(battery))
+
+        poll_times.sort()
+        if len(poll_times) >= 2:
+            span_seconds = (poll_times[-1] - poll_times[0]).total_seconds()
+            gap_seconds = span_seconds / (len(poll_times) - 1)
+        else:
+            gap_seconds = 30.0  # fallback assumption, matches Team Energy's interval
+
+        by_status = [
+            {
+                "status": status,
+                "poll_rows": count,
+                "approx_hours": round(count * gap_seconds / 3600, 2),
+            }
+            for status, count in sorted(
+                status_counts.items(), key=lambda item: -item[1]
+            )
+        ]
+        by_connector = []
+        for cid, count in sorted(
+            connector_charging_counts.items(), key=lambda item: -item[1]
+        ):
+            readings = connector_battery_readings.get(cid) or []
+            entry = {
+                "connector_id": cid,
+                **connector_meta[cid],
+                "charging_polls": count,
+                "approx_charging_hours": round(count * gap_seconds / 3600, 2),
+                "battery_in_percent": round(readings[0], 1) if readings else None,
+                "battery_out_percent": round(readings[-1], 1) if readings else None,
+                "battery_readings_count": len(readings),
+            }
+            if len(readings) >= 2:
+                entry["battery_delta_percent"] = round(
+                    readings[-1] - readings[0], 1
+                )
+            else:
+                entry["battery_delta_percent"] = None
+            by_connector.append(entry)
+
+        all_ins = [c["battery_in_percent"] for c in by_connector if c["battery_in_percent"] is not None]
+        all_outs = [c["battery_out_percent"] for c in by_connector if c["battery_out_percent"] is not None]
+        all_deltas = [c["battery_delta_percent"] for c in by_connector if c["battery_delta_percent"] is not None]
+        battery_summary = {
+            "connectors_with_battery_data": sum(
+                1 for c in by_connector if c["battery_readings_count"] > 0
+            ),
+            "avg_battery_in_percent": round(sum(all_ins) / len(all_ins), 1) if all_ins else None,
+            "avg_battery_out_percent": round(sum(all_outs) / len(all_outs), 1) if all_outs else None,
+            "avg_battery_delta_percent": round(sum(all_deltas) / len(all_deltas), 1) if all_deltas else None,
+            "note": (
+                "0% readings are treated as 'no data yet' and excluded "
+                "(same pattern seen on Team Energy's stateOfBattery). "
+                "A connector needs at least 2 real readings during one "
+                "charging session for in/out/delta to populate."
+            ),
+        }
+
+        return {
+            "window_hours": hours,
+            "approx_poll_interval_seconds": round(gap_seconds, 1),
+            "poll_count": len(poll_times),
+            "by_status": by_status,
+            "by_connector": by_connector,
+            "battery": battery_summary,
+        }
+
     def sessions_last_hours(
         self, hours: int = 24, include_sessions: bool = False
     ) -> dict[str, Any]:
         """Reconstruct real charging sessions from the poll log, for the
         last N hours. See _sessions_for_window() for the core logic.
+
+        By default (include_sessions=False) the raw per-session list is
+        omitted from the return - a network with many charging events can
+        produce hundreds of session records, which is far more than needed
+        for a routine check. Pass include_sessions=True to get the full
+        list back (e.g. for building a detailed report).
         """
         now = datetime.now(timezone.utc)
         cutoff = now - timedelta(hours=hours)
@@ -126,11 +282,13 @@ class EcoCarsStore:
         local_timezone rather than one flat total for the whole range.
 
         start_date / end_date are "YYYY-MM-DD" strings. Works on any
-        historical range already present in the poll log - only re-reads
-        and re-buckets existing data. Note: only covers whatever history is
-        actually in the poll log file - if ECOCARS_POLLS_PATH was not
-        pointed at the persistent volume until partway through the
-        requested range, earlier days may show zero/partial data.
+        historical range already present in the poll log - this only
+        re-reads and re-buckets existing data, it does not require the
+        range to be "from now on". Note: only covers whatever history is
+        actually in the poll log file - if EVAN_POLLS_PATH was not pointed
+        at the persistent volume until partway through the requested range,
+        earlier days may show zero/partial data (see conversation history
+        on the poll-log persistence fix).
         """
         try:
             from zoneinfo import ZoneInfo
@@ -144,13 +302,29 @@ class EcoCarsStore:
         if end < start:
             raise ValueError("end_date must not be before start_date")
 
+        range_start_utc = start.astimezone(timezone.utc)
+        range_end_utc = (end + timedelta(days=1)).astimezone(timezone.utc)
+
+        # Read the poll log ONCE for the entire requested range, rather than
+        # once per day - a 17-day range previously meant 17 full-file scans,
+        # which was slow enough to time out. This reads it a single time and
+        # buckets in memory instead.
+        all_polls = list(
+            self._iter_polls_since(range_start_utc, range_end_utc)
+        )
+
         days: list[dict[str, Any]] = []
         cursor = start
         while cursor <= end:
             day_start = cursor.astimezone(timezone.utc)
             day_end = (cursor + timedelta(days=1)).astimezone(timezone.utc)
-            result = self._sessions_for_window(
-                day_start, day_end, include_sessions=False
+            day_polls = [
+                (polled_at, connectors)
+                for polled_at, connectors in all_polls
+                if day_start <= polled_at < day_end
+            ]
+            result = self._sessions_from_polls(
+                day_polls, day_start, day_end, include_sessions=False
             )
             days.append({"date": cursor.strftime("%Y-%m-%d"), **result})
             cursor += timedelta(days=1)
@@ -161,18 +335,52 @@ class EcoCarsStore:
         self, window_start: datetime, window_end: datetime, include_sessions: bool
     ) -> dict[str, Any]:
         """Core session-reconstruction logic shared by sessions_last_hours()
-        and daily_sessions_summary(). Same transition-detection approach
-        validated on evan_store.py: walks each connector's polls in
-        [window_start, window_end) in time order, detects "not charging ->
-        charging -> not charging" as one session, and estimates duration via
-        the midpoint of each transition window rather than claiming an
-        exact second.
+        and daily_sessions_summary().
+
+        Walks each connector's polls in [window_start, window_end) in time
+        order and detects actual transitions into and out of "charging" -
+        the same core idea as Team Energy's connector_status_intervals,
+        adapted to this simpler flat poll-log format. A session here is
+        bounded by consecutive charging polls for one connector; a poll
+        where that connector is NOT charging (or is simply missing, e.g. a
+        temporary API hiccup) closes the session.
+
+        Session duration is estimated the same way Team Energy does: the
+        midpoint between the last non-charging poll and the first charging
+        poll, and between the last charging poll and the next non-charging
+        poll - splitting the "unknown" transition window rather than
+        pretending the exact start/end second is known.
+
+        This reads the poll log from disk itself, scoped to one window -
+        see _sessions_from_polls() for the pure-computation version used
+        when the caller has already loaded the polls (e.g. one multi-day
+        read shared across several day-buckets).
+        """
+        polls_in_window = list(
+            self._iter_polls_since(window_start, window_end)
+        )
+        return self._sessions_from_polls(
+            polls_in_window, window_start, window_end, include_sessions
+        )
+
+    def _sessions_from_polls(
+        self,
+        polls: list[tuple[datetime, list[dict]]],
+        window_start: datetime,
+        window_end: datetime,
+        include_sessions: bool,
+    ) -> dict[str, Any]:
+        """Pure computation over an already-loaded list of (polled_at,
+        connectors) tuples - no disk I/O here. Used both by
+        _sessions_for_window() (one window, reads the file itself) and by
+        daily_sessions_summary() (reads the file ONCE for the whole
+        requested range, then calls this once per day on the in-memory
+        slice - avoiding one full-file re-scan per day, which is what made
+        multi-day ranges slow/timeout-prone before this fix).
         """
         per_connector: dict[str, list[tuple[datetime, dict]]] = defaultdict(list)
         all_polls_in_window: list[datetime] = []
-        for polled_at, connectors in self._iter_polls_since(
-            window_start, window_end
-        ):
+        for polled_at, connectors in polls:
             all_polls_in_window.append(polled_at)
             for connector in connectors:
                 per_connector[connector["connector_id"]].append((polled_at, connector))
@@ -199,6 +407,9 @@ class EcoCarsStore:
             def close_session(end_boundary_poll: datetime | None):
                 if session_start_poll is None:
                     return
+                # Midpoint estimate: start is between the poll before charging
+                # began and the first charging poll; end is between the last
+                # charging poll and the next poll after charging ended.
                 est_start = session_start_poll
                 if session_prev_poll is not None:
                     est_start = session_prev_poll + (
@@ -233,7 +444,7 @@ class EcoCarsStore:
             previous_poll_time: datetime | None = None
             for poll_time, row in rows:
                 status = (row.get("status") or "").lower()
-                is_charging = status == "charging"
+                is_charging = "charg" in status
                 if is_charging and not in_session:
                     in_session = True
                     session_start_poll = poll_time
@@ -254,6 +465,8 @@ class EcoCarsStore:
                 previous_poll_time = poll_time
 
             if in_session:
+                # Still charging as of the most recent poll in the window -
+                # close it at the last seen poll (session may continue).
                 close_session(None)
 
         total_sessions = len(sessions)
@@ -263,62 +476,77 @@ class EcoCarsStore:
         for s in sessions:
             key = (s["station_name"], s["address"])
             entry = by_station.setdefault(
-                key,
-                {
-                    "station_name": s["station_name"],
-                    "address": s["address"],
-                    "cars_served": 0,
-                    "hours": 0.0,
-                },
+                key, {"station_name": s["station_name"], "address": s["address"], "cars_served": 0, "hours": 0.0}
             )
             entry["cars_served"] += 1
             entry["hours"] += s["duration_hours"]
         for entry in by_station.values():
             entry["hours"] = round(entry["hours"], 2)
 
-        top_by_hours = sorted(by_station.values(), key=lambda e: -e["hours"])[:5]
-        top_by_cars = sorted(by_station.values(), key=lambda e: -e["cars_served"])[:5]
+        top_by_hours = sorted(by_station.values(), key=lambda e: -e["hours"])[:3]
+        top_by_cars = sorted(by_station.values(), key=lambda e: -e["cars_served"])[:3]
 
-        # AC/DC split by rated power (same >=50kW threshold used for Evan,
-        # since EcoCars' data doesn't label station type at all).
-        ac_hours = sum(s["duration_hours"] for s in sessions if (s["power_kw"] or 0) < 50)
-        dc_hours = sum(s["duration_hours"] for s in sessions if (s["power_kw"] or 0) >= 50)
-        ac_tiers: dict[float, float] = defaultdict(float)
-        dc_tiers: dict[float, float] = defaultdict(float)
-        for s in sessions:
-            power = s["power_kw"] or 0
-            if power < 50:
-                ac_tiers[power] += s["duration_hours"]
-            else:
-                dc_tiers[power] += s["duration_hours"]
-
-        LOAD_FACTOR = 0.5
-        revenue = sum(
-            s["duration_hours"] * (s["power_kw"] or 0) * LOAD_FACTOR * (s["price"] or 0)
+        # Scenario revenue: duration x rated power x load factor x Evan's real
+        # per-connector price (same approach used for Team Energy). Two load
+        # factors are reported: the model default (0.5) and the factor
+        # measured from a real test charge (0.29) - see conversation history.
+        revenue_default = sum(
+            s["duration_hours"] * (s.get("power_kw") or 0) * 0.5 * (s.get("price") or 0)
             for s in sessions
         )
+        revenue_calibrated = revenue_default * (0.29 / 0.5)
 
-        battery_ins = [s["battery_in_percent"] for s in sessions if s["battery_in_percent"]]
-        battery_outs = [s["battery_out_percent"] for s in sessions if s["battery_out_percent"]]
-        battery_deltas = [
+        # AC/DC split by rated power (>=50kW counted as DC/fast-charging,
+        # matching the corrected classification used elsewhere - the raw
+        # station_type/connector_type_group label is unreliable at mixed
+        # AC+DC stations).
+        ac_hours = sum(s["duration_hours"] for s in sessions if (s.get("power_kw") or 0) < 50)
+        dc_hours = sum(s["duration_hours"] for s in sessions if (s.get("power_kw") or 0) >= 50)
+        ac_cars = sum(1 for s in sessions if (s.get("power_kw") or 0) < 50)
+        dc_cars = sum(1 for s in sessions if (s.get("power_kw") or 0) >= 50)
+        ac_kwh_ceiling = sum(
+            s["duration_hours"] * (s.get("power_kw") or 0)
+            for s in sessions if (s.get("power_kw") or 0) < 50
+        )
+        dc_kwh_ceiling = sum(
+            s["duration_hours"] * (s.get("power_kw") or 0)
+            for s in sessions if (s.get("power_kw") or 0) >= 50
+        )
+
+        battery_in = [s["battery_in_percent"] for s in sessions if s.get("battery_in_percent") is not None]
+        battery_out = [s["battery_out_percent"] for s in sessions if s.get("battery_out_percent") is not None]
+        battery_delta = [
             s["battery_out_percent"] - s["battery_in_percent"]
             for s in sessions
-            if s["battery_in_percent"] and s["battery_out_percent"]
+            if s.get("battery_in_percent") is not None and s.get("battery_out_percent") is not None
         ]
+
+        def battery_stats(values: list[float]) -> dict[str, Any]:
+            if not values:
+                return {"average_percent": None, "sample_size": 0}
+            return {
+                "average_percent": round(sum(values) / len(values), 1),
+                "sample_size": len(values),
+            }
 
         return {
             "approx_poll_interval_seconds": round(gap_seconds, 1),
             "total_sessions": total_sessions,
             "total_charging_hours": round(total_hours, 2),
-            "ac_hours": round(ac_hours, 2),
-            "dc_hours": round(dc_hours, 2),
-            "ac_hours_by_power_kw": dict(sorted(ac_tiers.items())),
-            "dc_hours_by_power_kw": dict(sorted(dc_tiers.items())),
-            "scenario_revenue_amd_load_0_5": round(revenue, 0),
-            "scenario_revenue_amd_load_0_29": round(revenue * 0.29 / 0.5, 0),
-            "avg_battery_in_percent": round(sum(battery_ins) / len(battery_ins), 1) if battery_ins else None,
-            "avg_battery_out_percent": round(sum(battery_outs) / len(battery_outs), 1) if battery_outs else None,
-            "avg_battery_delta_percent": round(sum(battery_deltas) / len(battery_deltas), 1) if battery_deltas else None,
+            "ac_charging_hours": round(ac_hours, 2),
+            "ac_cars_served": ac_cars,
+            "ac_rated_energy_ceiling_kwh": round(ac_kwh_ceiling, 1),
+            "dc_charging_hours": round(dc_hours, 2),
+            "dc_cars_served": dc_cars,
+            "dc_rated_energy_ceiling_kwh": round(dc_kwh_ceiling, 1),
+            "avg_session_minutes": round(total_hours / total_sessions * 60, 1)
+            if total_sessions
+            else None,
+            "scenario_revenue_amd_default_load_factor": round(revenue_default),
+            "scenario_revenue_amd_calibrated_load_factor": round(revenue_calibrated),
+            "battery_in": battery_stats(battery_in),
+            "battery_out": battery_stats(battery_out),
+            "battery_delta": battery_stats(battery_delta),
             "top_stations_by_hours": top_by_hours,
             "top_stations_by_cars": top_by_cars,
             "sessions": sessions if include_sessions else None,
