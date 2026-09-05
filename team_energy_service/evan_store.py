@@ -302,13 +302,29 @@ class EvanStore:
         if end < start:
             raise ValueError("end_date must not be before start_date")
 
+        range_start_utc = start.astimezone(timezone.utc)
+        range_end_utc = (end + timedelta(days=1)).astimezone(timezone.utc)
+
+        # Read the poll log ONCE for the entire requested range, rather than
+        # once per day - a 17-day range previously meant 17 full-file scans,
+        # which was slow enough to time out. This reads it a single time and
+        # buckets in memory instead.
+        all_polls = list(
+            self._iter_polls_since(range_start_utc, range_end_utc)
+        )
+
         days: list[dict[str, Any]] = []
         cursor = start
         while cursor <= end:
             day_start = cursor.astimezone(timezone.utc)
             day_end = (cursor + timedelta(days=1)).astimezone(timezone.utc)
-            result = self._sessions_for_window(
-                day_start, day_end, include_sessions=False
+            day_polls = [
+                (polled_at, connectors)
+                for polled_at, connectors in all_polls
+                if day_start <= polled_at < day_end
+            ]
+            result = self._sessions_from_polls(
+                day_polls, day_start, day_end, include_sessions=False
             )
             days.append({"date": cursor.strftime("%Y-%m-%d"), **result})
             cursor += timedelta(days=1)
@@ -334,14 +350,37 @@ class EvanStore:
         poll, and between the last charging poll and the next non-charging
         poll - splitting the "unknown" transition window rather than
         pretending the exact start/end second is known.
+
+        This reads the poll log from disk itself, scoped to one window -
+        see _sessions_from_polls() for the pure-computation version used
+        when the caller has already loaded the polls (e.g. one multi-day
+        read shared across several day-buckets).
         """
-        # Group poll rows by connector, in time order, keeping enough
-        # context (previous poll's time) to bound each session properly.
+        polls_in_window = list(
+            self._iter_polls_since(window_start, window_end)
+        )
+        return self._sessions_from_polls(
+            polls_in_window, window_start, window_end, include_sessions
+        )
+
+    def _sessions_from_polls(
+        self,
+        polls: list[tuple[datetime, list[dict]]],
+        window_start: datetime,
+        window_end: datetime,
+        include_sessions: bool,
+    ) -> dict[str, Any]:
+        """Pure computation over an already-loaded list of (polled_at,
+        connectors) tuples - no disk I/O here. Used both by
+        _sessions_for_window() (one window, reads the file itself) and by
+        daily_sessions_summary() (reads the file ONCE for the whole
+        requested range, then calls this once per day on the in-memory
+        slice - avoiding one full-file re-scan per day, which is what made
+        multi-day ranges slow/timeout-prone before this fix).
+        """
         per_connector: dict[str, list[tuple[datetime, dict]]] = defaultdict(list)
         all_polls_in_window: list[datetime] = []
-        for polled_at, connectors in self._iter_polls_since(
-            window_start, window_end
-        ):
+        for polled_at, connectors in polls:
             all_polls_in_window.append(polled_at)
             for connector in connectors:
                 per_connector[connector["connector_id"]].append((polled_at, connector))
