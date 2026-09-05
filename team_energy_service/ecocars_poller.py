@@ -13,6 +13,8 @@ from .ecocars_store import EcoCarsStore
 
 logger = logging.getLogger(__name__)
 
+ROLLUP_INTERVAL_SECONDS = 60 * 60  # 1 hour - see evan_poller.py for rationale
+
 
 class EcoCarsPoller:
     def __init__(
@@ -25,6 +27,7 @@ class EcoCarsPoller:
         self.store = store
         self.interval_seconds = interval_seconds
         self._stop = asyncio.Event()
+        self._last_rollup_at: float | None = None
 
     async def poll_once(self) -> int:
         polled_at = datetime.now(timezone.utc)
@@ -39,6 +42,23 @@ class EcoCarsPoller:
         )
         return rows_written
 
+    async def _maybe_rollup(self) -> None:
+        """See EvanPoller._maybe_rollup() for the full rationale - runs
+        once immediately, then at most once per ROLLUP_INTERVAL_SECONDS,
+        always off the event loop via asyncio.to_thread.
+        """
+        now = monotonic()
+        if self._last_rollup_at is not None and (
+            now - self._last_rollup_at < ROLLUP_INTERVAL_SECONDS
+        ):
+            return
+        self._last_rollup_at = now
+        try:
+            stats = await asyncio.to_thread(self.store.rollup_and_prune)
+            logger.info("EcoCars rollup+prune: %s", stats)
+        except Exception as exc:
+            logger.warning("EcoCars rollup+prune failed: %s", exc)
+
     async def run(self) -> None:
         failures = 0
         while not self._stop.is_set():
@@ -49,6 +69,8 @@ class EcoCarsPoller:
             except Exception as exc:
                 failures += 1
                 logger.warning("EcoCars poll failed (%s): %s", failures, exc)
+
+            await self._maybe_rollup()
 
             elapsed = monotonic() - started
             if failures:
