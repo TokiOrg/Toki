@@ -26,17 +26,36 @@ from pathlib import Path
 from typing import Any
 
 
+def _date_range(start: datetime, end: datetime):
+    """Yield each calendar-day datetime from start to end, inclusive."""
+    cursor = start
+    while cursor <= end:
+        yield cursor
+        cursor += timedelta(days=1)
+
+
 class EvanStore:
-    """Append-only JSON-lines store for raw Evan connector polls."""
+    """Append-only JSON-lines store for raw Evan connector polls.
+
+    Also maintains a small "rollup" file (one compact line per calendar
+    day) so that daily_sessions_summary() doesn't need to re-read the
+    entire raw poll log every time it's asked about a past day. Without
+    this, a multi-week raw log became too large to re-parse within a
+    typical web request's time limit (confirmed: even a single day's query
+    timed out once the log grew large enough) - see conversation history.
+    """
 
     def __init__(self, path: Path) -> None:
         self.path = path
+        self.rollup_path = path.with_name(path.stem + "_rollup.jsonl")
         self._lock = threading.RLock()
 
     def initialize(self) -> None:
         self.path.parent.mkdir(parents=True, exist_ok=True)
         if not self.path.exists():
             self.path.touch()
+        if not self.rollup_path.exists():
+            self.rollup_path.touch()
 
     def record_snapshot(self, stations: list[dict[str, Any]], polled_at: datetime) -> int:
         """Append one line with every connector's status from this poll.
@@ -281,14 +300,20 @@ class EvanStore:
         per calendar day between start_date and end_date (inclusive), in
         local_timezone rather than one flat total for the whole range.
 
-        start_date / end_date are "YYYY-MM-DD" strings. Works on any
-        historical range already present in the poll log - this only
-        re-reads and re-buckets existing data, it does not require the
-        range to be "from now on". Note: only covers whatever history is
-        actually in the poll log file - if EVAN_POLLS_PATH was not pointed
-        at the persistent volume until partway through the requested range,
-        earlier days may show zero/partial data (see conversation history
-        on the poll-log persistence fix).
+        start_date / end_date are "YYYY-MM-DD" strings. Uses a small
+        per-day rollup cache (see _load_rollups/_save_rollup) so that once
+        a day has been summarized, future requests for that day are served
+        from the tiny cached result instead of re-reading the (potentially
+        very large) raw poll log - this is what makes multi-day and even
+        single-day ranges fast once a day has been rolled up at least once.
+        The most recent (today's, still in progress) day is always computed
+        live rather than cached, since it's incomplete.
+
+        Only covers whatever history is actually in the poll log file - if
+        EVAN_POLLS_PATH was not pointed at the persistent volume until
+        partway through the requested range, earlier days may show
+        zero/partial data (see conversation history on the poll-log
+        persistence fix).
         """
         try:
             from zoneinfo import ZoneInfo
@@ -302,34 +327,126 @@ class EvanStore:
         if end < start:
             raise ValueError("end_date must not be before start_date")
 
-        range_start_utc = start.astimezone(timezone.utc)
-        range_end_utc = (end + timedelta(days=1)).astimezone(timezone.utc)
+        today_local = datetime.now(tz).strftime("%Y-%m-%d")
+        cached = self._load_rollups()
 
-        # Read the poll log ONCE for the entire requested range, rather than
-        # once per day - a 17-day range previously meant 17 full-file scans,
-        # which was slow enough to time out. This reads it a single time and
-        # buckets in memory instead.
-        all_polls = list(
-            self._iter_polls_since(range_start_utc, range_end_utc)
-        )
+        # Any requested day that's fully in the past and not yet cached
+        # needs to be computed once now, from the raw log, then saved so it
+        # never needs to be recomputed again.
+        missing_past_days = [
+            cursor.strftime("%Y-%m-%d")
+            for cursor in _date_range(start, end)
+            if cursor.strftime("%Y-%m-%d") != today_local
+            and cursor.strftime("%Y-%m-%d") not in cached
+        ]
+        if missing_past_days:
+            self._rollup_days(missing_past_days, tz)
+            cached = self._load_rollups()
 
         days: list[dict[str, Any]] = []
-        cursor = start
-        while cursor <= end:
-            day_start = cursor.astimezone(timezone.utc)
-            day_end = (cursor + timedelta(days=1)).astimezone(timezone.utc)
+        for cursor in _date_range(start, end):
+            date_str = cursor.strftime("%Y-%m-%d")
+            if date_str == today_local:
+                # Today is still in progress - always compute live from
+                # whatever's in the raw log so far, never cache it.
+                day_start = cursor.astimezone(timezone.utc)
+                day_end = (cursor + timedelta(days=1)).astimezone(timezone.utc)
+                polls_today = list(self._iter_polls_since(day_start, day_end))
+                result = self._sessions_from_polls(
+                    polls_today, day_start, day_end, include_sessions=False
+                )
+                days.append({"date": date_str, **result})
+            elif date_str in cached:
+                days.append(cached[date_str])
+            else:
+                # Day is in the past but there was nothing to roll up
+                # (e.g. before polling started) - report an empty day
+                # rather than silently omitting it.
+                days.append(
+                    {
+                        "date": date_str,
+                        "approx_poll_interval_seconds": None,
+                        "total_sessions": 0,
+                        "total_charging_hours": 0.0,
+                        "ac_charging_hours": 0.0,
+                        "ac_cars_served": 0,
+                        "ac_rated_energy_ceiling_kwh": 0.0,
+                        "dc_charging_hours": 0.0,
+                        "dc_cars_served": 0,
+                        "dc_rated_energy_ceiling_kwh": 0.0,
+                        "avg_session_minutes": None,
+                        "scenario_revenue_amd_default_load_factor": 0,
+                        "scenario_revenue_amd_calibrated_load_factor": 0,
+                        "battery_in": {"average_percent": None, "sample_size": 0},
+                        "battery_out": {"average_percent": None, "sample_size": 0},
+                        "battery_delta": {"average_percent": None, "sample_size": 0},
+                        "top_stations_by_hours": [],
+                        "top_stations_by_cars": [],
+                        "sessions": None,
+                    }
+                )
+
+        return {"start_date": start_date, "end_date": end_date, "days": days}
+
+    def _load_rollups(self) -> dict[str, dict[str, Any]]:
+        """Read the small rollup cache file into a {date: summary} dict."""
+        cached: dict[str, dict[str, Any]] = {}
+        if not self.rollup_path.exists():
+            return cached
+        with self.rollup_path.open("r", encoding="utf-8") as handle:
+            for raw_line in handle:
+                raw_line = raw_line.strip()
+                if not raw_line:
+                    continue
+                try:
+                    record = json.loads(raw_line)
+                    cached[record["date"]] = record
+                except (json.JSONDecodeError, KeyError):
+                    continue
+        return cached
+
+    def _rollup_days(self, dates: list[str], tz) -> None:
+        """Compute and persist the summary for each given past day.
+
+        Reads the raw poll log ONCE across the full span of the requested
+        dates (not once per date), computes each day's summary from that
+        single read, and appends the results to the rollup cache file.
+        Safe to call with dates that turn out to have no data at all (e.g.
+        before polling started) - those are simply not written, and
+        daily_sessions_summary() reports them as empty days instead.
+        """
+        if not dates:
+            return
+        parsed = sorted(
+            datetime.strptime(d, "%Y-%m-%d").replace(tzinfo=tz) for d in dates
+        )
+        range_start_utc = parsed[0].astimezone(timezone.utc)
+        range_end_utc = (parsed[-1] + timedelta(days=1)).astimezone(timezone.utc)
+        all_polls = list(self._iter_polls_since(range_start_utc, range_end_utc))
+
+        new_lines = []
+        for day_dt in parsed:
+            date_str = day_dt.strftime("%Y-%m-%d")
+            day_start = day_dt.astimezone(timezone.utc)
+            day_end = (day_dt + timedelta(days=1)).astimezone(timezone.utc)
             day_polls = [
                 (polled_at, connectors)
                 for polled_at, connectors in all_polls
                 if day_start <= polled_at < day_end
             ]
+            if not day_polls:
+                continue  # nothing recorded that day - leave uncached
             result = self._sessions_from_polls(
                 day_polls, day_start, day_end, include_sessions=False
             )
-            days.append({"date": cursor.strftime("%Y-%m-%d"), **result})
-            cursor += timedelta(days=1)
+            new_lines.append(
+                json.dumps({"date": date_str, **result}, ensure_ascii=False)
+            )
 
-        return {"start_date": start_date, "end_date": end_date, "days": days}
+        if new_lines:
+            with self._lock:
+                with self.rollup_path.open("a", encoding="utf-8") as handle:
+                    handle.write("\n".join(new_lines) + "\n")
 
     def _sessions_for_window(
         self, window_start: datetime, window_end: datetime, include_sessions: bool
