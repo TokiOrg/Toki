@@ -128,7 +128,7 @@ class EvanStore:
                 handle.write(line + "\n")
         return len(connectors)
 
-    def _iter_polls_since(self, cutoff: datetime):
+    def _iter_polls_since(self, cutoff: datetime, until: datetime | None = None):
         if not self.path.exists():
             return
         with self.path.open("r", encoding="utf-8") as handle:
@@ -141,7 +141,7 @@ class EvanStore:
                     polled_at = datetime.fromisoformat(record["polled_at"])
                 except (json.JSONDecodeError, KeyError, ValueError):
                     continue
-                if polled_at >= cutoff:
+                if polled_at >= cutoff and (until is None or polled_at < until):
                     yield polled_at, record["connectors"]
 
     def summary_last_hours(self, hours: int = 24) -> dict[str, Any]:
@@ -260,22 +260,8 @@ class EvanStore:
     def sessions_last_hours(
         self, hours: int = 24, include_sessions: bool = False
     ) -> dict[str, Any]:
-        """Reconstruct real charging sessions from the poll log.
-
-        Unlike summary_last_hours() (which just counts polls per status),
-        this walks each connector's polls in time order and detects actual
-        transitions into and out of "charging" - the same core idea as
-        Team Energy's connector_status_intervals, adapted to this simpler
-        flat poll-log format. A session here is bounded by consecutive
-        charging polls for one connector; a poll where that connector is
-        NOT charging (or is simply missing, e.g. a temporary API hiccup)
-        closes the session.
-
-        Session duration is estimated the same way Team Energy does: the
-        midpoint between the last non-charging poll and the first charging
-        poll, and between the last charging poll and the next non-charging
-        poll - splitting the "unknown" transition window rather than
-        pretending the exact start/end second is known.
+        """Reconstruct real charging sessions from the poll log, for the
+        last N hours. See _sessions_for_window() for the core logic.
 
         By default (include_sessions=False) the raw per-session list is
         omitted from the return - a network with many charging events can
@@ -283,13 +269,79 @@ class EvanStore:
         for a routine check. Pass include_sessions=True to get the full
         list back (e.g. for building a detailed report).
         """
-        cutoff = datetime.now(timezone.utc) - timedelta(hours=hours)
+        now = datetime.now(timezone.utc)
+        cutoff = now - timedelta(hours=hours)
+        result = self._sessions_for_window(cutoff, now, include_sessions)
+        return {"window_hours": hours, **result}
 
+    def daily_sessions_summary(
+        self, start_date: str, end_date: str, local_timezone: str = "Asia/Yerevan"
+    ) -> dict[str, Any]:
+        """Same metrics as sessions_last_hours(), but returned as one block
+        per calendar day between start_date and end_date (inclusive), in
+        local_timezone rather than one flat total for the whole range.
+
+        start_date / end_date are "YYYY-MM-DD" strings. Works on any
+        historical range already present in the poll log - this only
+        re-reads and re-buckets existing data, it does not require the
+        range to be "from now on". Note: only covers whatever history is
+        actually in the poll log file - if EVAN_POLLS_PATH was not pointed
+        at the persistent volume until partway through the requested range,
+        earlier days may show zero/partial data (see conversation history
+        on the poll-log persistence fix).
+        """
+        try:
+            from zoneinfo import ZoneInfo
+
+            tz = ZoneInfo(local_timezone)
+        except Exception:  # pragma: no cover - fallback if tzdata missing
+            tz = timezone.utc
+
+        start = datetime.strptime(start_date, "%Y-%m-%d").replace(tzinfo=tz)
+        end = datetime.strptime(end_date, "%Y-%m-%d").replace(tzinfo=tz)
+        if end < start:
+            raise ValueError("end_date must not be before start_date")
+
+        days: list[dict[str, Any]] = []
+        cursor = start
+        while cursor <= end:
+            day_start = cursor.astimezone(timezone.utc)
+            day_end = (cursor + timedelta(days=1)).astimezone(timezone.utc)
+            result = self._sessions_for_window(
+                day_start, day_end, include_sessions=False
+            )
+            days.append({"date": cursor.strftime("%Y-%m-%d"), **result})
+            cursor += timedelta(days=1)
+
+        return {"start_date": start_date, "end_date": end_date, "days": days}
+
+    def _sessions_for_window(
+        self, window_start: datetime, window_end: datetime, include_sessions: bool
+    ) -> dict[str, Any]:
+        """Core session-reconstruction logic shared by sessions_last_hours()
+        and daily_sessions_summary().
+
+        Walks each connector's polls in [window_start, window_end) in time
+        order and detects actual transitions into and out of "charging" -
+        the same core idea as Team Energy's connector_status_intervals,
+        adapted to this simpler flat poll-log format. A session here is
+        bounded by consecutive charging polls for one connector; a poll
+        where that connector is NOT charging (or is simply missing, e.g. a
+        temporary API hiccup) closes the session.
+
+        Session duration is estimated the same way Team Energy does: the
+        midpoint between the last non-charging poll and the first charging
+        poll, and between the last charging poll and the next non-charging
+        poll - splitting the "unknown" transition window rather than
+        pretending the exact start/end second is known.
+        """
         # Group poll rows by connector, in time order, keeping enough
         # context (previous poll's time) to bound each session properly.
         per_connector: dict[str, list[tuple[datetime, dict]]] = defaultdict(list)
         all_polls_in_window: list[datetime] = []
-        for polled_at, connectors in self._iter_polls_since(cutoff):
+        for polled_at, connectors in self._iter_polls_since(
+            window_start, window_end
+        ):
             all_polls_in_window.append(polled_at)
             for connector in connectors:
                 per_connector[connector["connector_id"]].append((polled_at, connector))
@@ -439,7 +491,6 @@ class EvanStore:
             }
 
         return {
-            "window_hours": hours,
             "approx_poll_interval_seconds": round(gap_seconds, 1),
             "total_sessions": total_sessions,
             "total_charging_hours": round(total_hours, 2),
