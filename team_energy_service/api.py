@@ -359,6 +359,45 @@ def create_app(
         )
         return {"available": True, **result}
 
+    @app.post("/debug/evan-rollup-now")
+    async def debug_evan_rollup_now(request: Request) -> dict:
+        """Manually trigger the background rollup+prune pass immediately,
+        rather than waiting for its normal hourly schedule. Returns right
+        away without waiting for it to finish - rollup_and_prune can take
+        real wall-clock time on a large raw log, so this starts it as a
+        background task instead of blocking this HTTP request (which would
+        risk timing out the same way the old on-demand computation did).
+        Check /debug/evan-sessions or /debug/evan-daily afterward (allow
+        it a little time to finish) to see the effect. Requires the shared
+        web credentials.
+        """
+        store = getattr(request.app.state, "evan_store", None)
+        if store is None:
+            return {
+                "available": False,
+                "detail": (
+                    "Evan polling isn't configured (EVAN_PHONE/EVAN_PASSWORD "
+                    "not set)."
+                ),
+            }
+
+        async def _run():
+            try:
+                stats = await asyncio.to_thread(store.rollup_and_prune)
+                logging.getLogger(__name__).info(
+                    "Evan manual rollup+prune: %s", stats
+                )
+            except Exception as exc:
+                logging.getLogger(__name__).warning(
+                    "Evan manual rollup+prune failed: %s", exc
+                )
+
+        asyncio.create_task(_run())
+        return {
+            "started": True,
+            "detail": "Rollup+prune started in the background - check back shortly.",
+        }
+
     @app.get("/debug/ecocars-sessions")
     async def debug_ecocars_sessions(
         request: Request,
@@ -408,6 +447,37 @@ def create_app(
             store.daily_sessions_summary, start_date, end_date
         )
         return {"available": True, **result}
+
+    @app.post("/debug/ecocars-rollup-now")
+    async def debug_ecocars_rollup_now(request: Request) -> dict:
+        """Manually trigger the background rollup+prune pass immediately.
+        See /debug/evan-rollup-now for the full rationale - starts as a
+        background task and returns right away rather than blocking this
+        request. Requires the shared web credentials.
+        """
+        store = getattr(request.app.state, "ecocars_store", None)
+        if store is None:
+            return {
+                "available": False,
+                "detail": "EcoCars polling isn't configured (ECOCARS_ENABLED not set).",
+            }
+
+        async def _run():
+            try:
+                stats = await asyncio.to_thread(store.rollup_and_prune)
+                logging.getLogger(__name__).info(
+                    "EcoCars manual rollup+prune: %s", stats
+                )
+            except Exception as exc:
+                logging.getLogger(__name__).warning(
+                    "EcoCars manual rollup+prune failed: %s", exc
+                )
+
+        asyncio.create_task(_run())
+        return {
+            "started": True,
+            "detail": "Rollup+prune started in the background - check back shortly.",
+        }
 
     @app.get("/collector/gaps")
     async def collector_gaps(
