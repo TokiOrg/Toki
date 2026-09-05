@@ -19,6 +19,11 @@ from .evan_store import EvanStore
 
 logger = logging.getLogger(__name__)
 
+# How often to run the background rollup+prune pass. This is deliberately
+# infrequent (not every poll) since it's a real, if now memory-safe, disk
+# scan - no need to run it more than a few times a day.
+ROLLUP_INTERVAL_SECONDS = 60 * 60  # 1 hour
+
 
 class EvanPoller:
     def __init__(
@@ -33,6 +38,7 @@ class EvanPoller:
         self.interval_seconds = interval_seconds
         self.grid_centers = grid_centers
         self._stop = asyncio.Event()
+        self._last_rollup_at: float | None = None
 
     async def poll_once(self) -> int:
         polled_at = datetime.now(timezone.utc)
@@ -47,6 +53,29 @@ class EvanPoller:
         )
         return rows_written
 
+    async def _maybe_rollup(self) -> None:
+        """Run rollup_and_prune in a background thread if it's due.
+
+        Always runs once on the very first check (so an existing large
+        backlog - e.g. the 2.6GB raw log encountered before this fix -
+        gets processed and pruned shortly after deploy, not an hour later),
+        then at most once per ROLLUP_INTERVAL_SECONDS after that. This
+        never runs inside an HTTP request - only from this background poll
+        loop - since even the memory-safe streaming version takes real
+        wall-clock time on a very large file.
+        """
+        now = monotonic()
+        if self._last_rollup_at is not None and (
+            now - self._last_rollup_at < ROLLUP_INTERVAL_SECONDS
+        ):
+            return
+        self._last_rollup_at = now
+        try:
+            stats = await asyncio.to_thread(self.store.rollup_and_prune)
+            logger.info("Evan rollup+prune: %s", stats)
+        except Exception as exc:
+            logger.warning("Evan rollup+prune failed: %s", exc)
+
     async def run(self) -> None:
         failures = 0
         while not self._stop.is_set():
@@ -57,6 +86,8 @@ class EvanPoller:
             except Exception as exc:
                 failures += 1
                 logger.warning("Evan poll failed (%s): %s", failures, exc)
+
+            await self._maybe_rollup()
 
             elapsed = monotonic() - started
             if failures:
