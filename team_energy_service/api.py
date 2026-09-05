@@ -234,6 +234,24 @@ def create_app(
         database = request.app.state.database
         return await asyncio.to_thread(database.recent_summary, hours)
 
+    @app.get("/debug/daily-summary")
+    async def debug_daily_summary(
+        request: Request,
+        start_date: str,
+        end_date: str,
+    ) -> dict:
+        """Same metrics as /debug/recent-summary, but returned as one block
+        per calendar day between start_date and end_date (inclusive), e.g.
+        start_date=2026-08-19&end_date=2026-09-04. Dates are "YYYY-MM-DD".
+        Works on any historical range already collected - Team Energy's
+        database has been persistent since the start, so this should cover
+        the full history. Requires the shared web credentials.
+        """
+        database = request.app.state.database
+        return await asyncio.to_thread(
+            database.daily_summary, start_date, end_date
+        )
+
     @app.get("/analytics/map")
     async def map_analytics(
         request: Request,
@@ -313,6 +331,34 @@ def create_app(
         )
         return {"available": True, **sessions}
 
+    @app.get("/debug/evan-daily")
+    async def debug_evan_daily(
+        request: Request,
+        start_date: str,
+        end_date: str,
+    ) -> dict:
+        """Same metrics as /debug/evan-sessions, but returned as one block
+        per calendar day between start_date and end_date (inclusive), e.g.
+        start_date=2026-08-19&end_date=2026-09-04. Dates are "YYYY-MM-DD".
+        Only covers whatever history is actually in the persistent poll
+        log - if EVAN_POLLS_PATH was only recently pointed at the
+        persistent volume, earlier days in the range may show zero/partial
+        data. Requires the shared web credentials.
+        """
+        store = getattr(request.app.state, "evan_store", None)
+        if store is None:
+            return {
+                "available": False,
+                "detail": (
+                    "Evan polling isn't configured (EVAN_PHONE/EVAN_PASSWORD "
+                    "not set)."
+                ),
+            }
+        result = await asyncio.to_thread(
+            store.daily_sessions_summary, start_date, end_date
+        )
+        return {"available": True, **result}
+
     @app.get("/debug/ecocars-sessions")
     async def debug_ecocars_sessions(
         request: Request,
@@ -335,6 +381,33 @@ def create_app(
             store.sessions_last_hours, hours, include_sessions
         )
         return {"available": True, **sessions}
+
+    @app.get("/debug/ecocars-daily")
+    async def debug_ecocars_daily(
+        request: Request,
+        start_date: str,
+        end_date: str,
+    ) -> dict:
+        """Same metrics as /debug/ecocars-sessions, but returned as one
+        block per calendar day between start_date and end_date (inclusive),
+        e.g. start_date=2026-08-19&end_date=2026-09-04. Dates are
+        "YYYY-MM-DD". Only covers whatever history is actually in the
+        persistent poll log - if ECOCARS_POLLS_PATH was only recently
+        pointed at the persistent volume, earlier days in the range may
+        show zero/partial data, and Georgian stations remain mixed in until
+        the Armenia-only filter is deployed. Requires the shared web
+        credentials.
+        """
+        store = getattr(request.app.state, "ecocars_store", None)
+        if store is None:
+            return {
+                "available": False,
+                "detail": "EcoCars polling isn't configured (ECOCARS_ENABLED not set).",
+            }
+        result = await asyncio.to_thread(
+            store.daily_sessions_summary, start_date, end_date
+        )
+        return {"available": True, **result}
 
     @app.get("/collector/gaps")
     async def collector_gaps(
